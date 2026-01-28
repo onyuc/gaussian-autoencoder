@@ -1,0 +1,43 @@
+# Default Training Configuration
+
+# Data
+data:
+  voxel_size: 100.0
+  max_level: 16
+  min_gaussians: 8
+  max_gaussians: 128
+  val_split: 0.1
+
+# Model
+model:
+  input_dim: 59
+  latent_dim: 256
+  num_queries: 64
+  nhead: 8
+  num_enc_layers: 4
+  num_dec_layers: 4
+
+# Training
+training:
+  batch_size: 32
+  epochs: 5000
+  lr: 0.0001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+
+# Loss
+loss:
+  type: "chamfer"
+  lambda_density: 1.0
+  lambda_render: 10.0
+  lambda_sparsity: 0.1
+  lambda_attr: 0.5
+  n_density_samples: 1024
+  render_resolution: 64
+  warmup_iterations: 100000
+
+# Output
+output:
+  save_dir: "./checkpoints/chamfer"
+  save_interval: 100
+  debug_save_interval: 100

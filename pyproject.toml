@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gs-merge"
+version = "2.0.0"
+description = "Gaussian Splatting Compression via Learned Merging"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "GS_Merge Team"}
+]
+keywords = ["gaussian-splatting", "3d", "compression", "neural-rendering"]
+
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "plyfile>=0.8.0",
+    "tqdm>=4.64.0",
+    "pillow>=9.0.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "gsplat>=1.0.0",
+    "fused-ssim",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+]
+
+[project.scripts]
+gs-merge-train = "scripts.train:main"
+gs-merge-compress = "scripts.compress:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gs_merge*", "scripts*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
