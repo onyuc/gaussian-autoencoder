@@ -1,4 +1,4 @@
-# GS_Merge v2.0
+# gaussian-autoencoder
 
 Gaussian Splatting Compression via Learned Merging
 
@@ -13,7 +13,7 @@ Voxel 단위로 Gaussian들을 압축하는 Transformer 기반 AutoEncoder
 
 ```bash
 # Clone repository
-cd GS_Merge_v2
+cd gaussian-autoencoder
 
 # Install package
 pip install -e .
@@ -46,7 +46,7 @@ python scripts/compress.py \
 ## Project Structure
 
 ```
-GS_Merge_v2/
+gaussian-autoencoder/
 ├── gs_merge/                   # Main package
 │   ├── __init__.py
 │   ├── model/                  # Neural network models

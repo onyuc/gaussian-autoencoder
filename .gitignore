@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 
 # Data directories
-inputs/
+inputs/*
+!inputs/point_cloud.ply
 outputs/
 checkpoints/
