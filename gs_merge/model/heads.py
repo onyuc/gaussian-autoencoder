@@ -16,7 +16,7 @@ class GaussianHeads(nn.Module):
     출력 형식 (log/logit space):
     - xyz: tanh [-1, 1] (voxel 내 정규화 좌표)
     - rotation: normalized quaternion
-    - scale: log space (clamp -10 ~ 5)
+    - scale: log space
     - opacity: logit space
     - sh: raw values
     """
@@ -28,7 +28,8 @@ class GaussianHeads(nn.Module):
         self.head_rot = nn.Linear(latent_dim, 4)
         self.head_scale = nn.Linear(latent_dim, 3)
         self.head_opacity = nn.Linear(latent_dim, 1)
-        self.head_sh = nn.Linear(latent_dim, sh_dim)
+        self.head_sh_dc = nn.Linear(latent_dim, 3)
+        self.head_sh_rest = nn.Linear(latent_dim, sh_dim - 3)
         
 
         self.max_scale = 15.0  # scale의 최대값 제한 (실제 scale = exp(output))
@@ -51,17 +52,17 @@ class GaussianHeads(nn.Module):
         # Rotation: Quaternion 정규화
         rot = F.normalize(self.head_rot(features), dim=-1)
         
-        # Scale: log space (실제 scale = exp(출력))
+        # Scale: log space (실제 scale = exp(출력)), 최대값 제한
         normalized_scale = torch.sigmoid(self.head_scale(features))
         target_scale = normalized_scale * self.max_scale + 1e-8 # 0이 되지 않게 안전장치
-        
-        # 3. 다시 Log를 취해서 내보냄 (기존 파이프라인 유지)
         scale = torch.log(target_scale)
         
         # Opacity: logit space (실제 opacity = sigmoid(출력))
         opacity = self.head_opacity(features)
         
         # SH: 색상 계수
-        sh = self.head_sh(features)
+        sh_dc = self.head_sh_dc(features)
+        sh_rest = self.head_sh_rest(features)
+        sh = torch.cat([sh_dc, sh_rest], dim=-1)
         
         return xyz, rot, scale, opacity, sh

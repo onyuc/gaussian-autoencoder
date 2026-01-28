@@ -30,7 +30,7 @@ loss:
   type: "gmae"  # or "chamfer"
   lambda_density: 1.0
   lambda_render: 10.0
-  lambda_sparsity: 0.1
+  lambda_sparsity: 0.01
   lambda_attr: 0.5
   n_density_samples: 1024
   render_resolution: 64
@@ -38,6 +38,6 @@ loss:
 
 # Output
 output:
-  save_dir: "./checkpoints/test_no_reg"
+  save_dir: "./checkpoints/test_opacity_grow"
   save_interval: 100
   debug_save_interval: 100

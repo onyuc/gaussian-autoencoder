@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 
 
-from fused_ssim import fused_ssim
+# from fused_ssim import fused_ssim
 from gsplat import rasterization
 
 
@@ -236,26 +236,89 @@ class GMAELoss(nn.Module):
         g_dict: Dict[str, torch.Tensor],
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """GMM Density: Sum( alpha * exp(-dist^2 / scale^2) )"""
-        xyz = g_dict['xyz']
-        scale = torch.exp(g_dict['scale']).clamp(min=1e-6, max=100.0)
-        opacity = torch.sigmoid(g_dict['opacity']).clamp(1e-6, 1.0)
+        """
+        3DGS Density with Rotation
+        exp( -0.5 * (x-mu)^T * Sigma^-1 * (x-mu) )
+        """
+        B, N, _ = g_dict['xyz'].shape
+        device = g_dict['xyz'].device
         
+        # 1. 파라미터 준비
+        xyz = g_dict['xyz']      # [B, N, 3]
+        scale = torch.exp(g_dict['scale']).clamp(min=1e-6, max=100.0) # [B, N, 3]
+        opacity = torch.sigmoid(g_dict['opacity']).clamp(1e-6, 1.0)   # [B, N, 1]
+        rot = F.normalize(g_dict['rotation'], dim=-1) # [B, N, 4] Quaternion
+        
+        # 2. 마스크 처리
         if mask is not None:
             valid_mask = (~mask).unsqueeze(-1).float()
             opacity = opacity * valid_mask
 
-        diff = queries.unsqueeze(2) - xyz.unsqueeze(1)
-        scale_sq = scale.unsqueeze(1) ** 2 + 1e-8
-        inv_scale_sq = 1.0 / scale_sq
+        # 3. Quaternion -> Rotation Matrix 변환
+        # (PyTorch 내장 함수가 없다면 아래 헬퍼 함수 사용, gsplat 등 외부 라이브러리 써도 됨)
+        R = self._quat_to_rotmat(rot) # [B, N, 3, 3]
+
+        # 4. 거리 벡터 계산 (World Space)
+        # queries: [B, M, 3]
+        # xyz:     [B, N, 3]
+        # diff:    [B, M, N, 3]
+        diff = queries.unsqueeze(2) - xyz.unsqueeze(1) 
+
+        # 5. [핵심] Local Frame으로 회전 (World Diff -> Local Diff)
+        # diff_local = diff @ R (Batch Matmul)
+        # R은 [B, N, 3, 3]이므로, K차원에 대해 브로드캐스팅 필요
+        # 식: v_local = v_world * R  (R은 row-major 기준, 혹은 R^T 곱하기)
+        # Quaternion to Rotmat 보통 R * v 형태이므로, v^T * R^T = (R * v)^T 
+        # 간단히: diff 벡터를 가우시안의 회전 역방향으로 돌림
         
-        dist_sq = torch.sum((diff ** 2) * inv_scale_sq, dim=-1).clamp(max=50)
+        # [B, 1, N, 3, 3]으로 확장하여 곱셈
+        # diff: [B, K, N, 3] -> [B, K, N, 1, 3]
+        # R: [B, N, 3, 3] -> [B, 1, N, 3, 3]
+        # 결과: [B, K, N, 1, 3] @ [B, 1, N, 3, 3] (Transpose R) -> 복잡함.
         
-        weights = opacity.squeeze(-1).unsqueeze(1)
+        # 더 쉬운 방법: einsum 사용
+        # b: batch, k: query, n: gaussian, i: world_dim, j: local_dim
+        # diff[b,k,n,i], R[b,n,j,i] (R^T를 곱해야 Local로 감) -> local[b,k,n,j]
+        diff_local = torch.einsum('bkni,bnji->bknj', diff, R)
+        
+        # 6. Scale로 나누기 (Mahalanobis Distance의 핵심)
+        # 이제 로컬 좌표계이므로 그냥 스케일로 나누면 됨
+        # scale: [B, N, 3] -> [B, 1, N, 3]
+        inv_scale = 1.0 / (scale.unsqueeze(1) + 1e-8)
+        norm_diff = diff_local * inv_scale
+        
+        # 7. 거리 제곱 합 (Squared Norm)
+        dist_sq = torch.sum(norm_diff ** 2, dim=-1).clamp(max=50) # [B, K, N]
+        
+        # 8. Gaussian Density 계산
+        weights = opacity.squeeze(-1).unsqueeze(1) # [B, 1, N]
         density_per_gaussian = weights * torch.exp(-0.5 * dist_sq)
-        total_density = torch.sum(density_per_gaussian, dim=-1)
+        
+        # 9. 최종 합산
+        total_density = torch.sum(density_per_gaussian, dim=-1) # [B, K]
         
         return total_density
+
+    def _quat_to_rotmat(self, quat):
+        """Quaternion(w,x,y,z) -> Rotation Matrix(3x3)"""
+        # 정규화 가정 (quat은 이미 normalize 되어야 함)
+        w, x, y, z = quat.unbind(-1)
+        
+        xx = x * x
+        yy = y * y
+        zz = z * z
+        xy = x * y
+        xz = x * z
+        yz = y * z
+        wx = w * x
+        wy = w * y
+        wz = w * z
+        
+        row0 = torch.stack([1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)], dim=-1)
+        row1 = torch.stack([2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)], dim=-1)
+        row2 = torch.stack([2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)], dim=-1)
+        
+        return torch.stack([row0, row1, row2], dim=-2) # [..., 3, 3]
 
     # =========================================================================
     # [2] Random Rendering Loss (gsplat)
@@ -288,8 +351,8 @@ class GMAELoss(nn.Module):
             
             view_mat, K = self._get_random_camera(device, H, W, fov_y, radius=5.0)
             
-            img_in = self._render_with_gsplat(in_g_b, in_mask_b, view_mat, K, H, W)
-            img_out = self._render_with_gsplat(out_g_b, out_mask_b, view_mat, K, H, W)
+            img_in, alpha_in = self._render_with_gsplat(in_g_b, in_mask_b, view_mat, K, H, W)
+            img_out, alpha_out = self._render_with_gsplat(out_g_b, out_mask_b, view_mat, K, H, W)
             
             # Debug 이미지 저장
             if b == 0:
@@ -301,26 +364,38 @@ class GMAELoss(nn.Module):
             
 
             if img_in.abs().sum() > 1e-6 or img_out.abs().sum() > 1e-6:
-                
-                # alpha = min(1.0, self._iteration / max(self.warmup_iterations, 1))
-                # panalty_balck = (1 - alpha) * (1 - img_out.max()) * img_in.max()
-                panalty_balck = (img_in.max() - img_out.max()).abs() + (img_in.max() - img_out.mean()).abs()
 
-                loss_global_l1 = F.l1_loss(img_out, img_in)
-                
                 pixel_brightness_in = img_in.sum(dim=-1)
                 mask_rendered = (pixel_brightness_in > 0.01).float()
                 n_rendered = mask_rendered.sum() + 1e-6
                 
                 diff = (img_out - img_in).abs()
-                loss_masked_l1 = (diff * mask_rendered.unsqueeze(-1)).sum() / (n_rendered * 3)
+                loss_rendered_masked_l1 = (diff * mask_rendered.unsqueeze(-1)).sum() / (n_rendered * 3)
+                loss_rendered_l1 = F.l1_loss(img_out, img_in)
+                loss_rendered = 1.0 * loss_rendered_masked_l1 + 0.3 * loss_rendered_l1
                 
-                loss_ssim = (1 - fused_ssim(
-                    img_out.permute(2, 0, 1).unsqueeze(0),
-                    img_in.permute(2, 0, 1).unsqueeze(0),
-                    padding="valid"
-                ))
-                total_loss += 1.0 * loss_masked_l1 + 0.2 * loss_ssim + 0.1 * loss_global_l1 + panalty_balck
+                # loss_ssim = (1 - fused_ssim(
+                #     img_out.permute(2, 0, 1).unsqueeze(0),
+                #     img_in.permute(2, 0, 1).unsqueeze(0),
+                #     padding="valid"
+                # ))
+
+                mask_alpha = (alpha_in > 0.01).float()
+                n_alpha = mask_alpha.sum() + 1e-6
+                loss_alpha_masked_l1 = (F.l1_loss(alpha_out, alpha_in) * mask_alpha).sum() / n_alpha
+                loss_alpha_l1 = F.l1_loss(alpha_out.squeeze(), alpha_in.squeeze())
+                loss_alpha = 1 * loss_alpha_masked_l1 + 0.3 * loss_alpha_l1
+
+
+                # seed 가 될 pixel에 강력한 gradient이 흐르도록 유도
+                warmup = min(1.0, self._iteration / max(self.warmup_iterations, 1))
+                cooldown = 1.0 - warmup
+                
+                render_seed = (img_in.max() - img_out.max()).abs()
+                alpha_seed = (alpha_in.max() - alpha_out.max()).abs()
+                gaussian_seed = cooldown * (render_seed + alpha_seed)
+
+                total_loss += loss_rendered + loss_alpha + gaussian_seed * 1
                 valid_count += 1
         
         if valid_count == 0:
@@ -395,10 +470,10 @@ class GMAELoss(nn.Module):
             )
             
             render_colors = render_colors.squeeze(0).clamp(0.0, 1.0)
-            return render_colors
+            return render_colors, render_alphas
         except Exception as e:
             print(f"[gsplat error] {e}")
-            return torch.zeros((H, W, 3), device=device, requires_grad=True)
+            return torch.zeros((H, W, 3), device=device, requires_grad=True), torch.zeros((H, W), device=device, requires_grad=True)
     
     def _get_random_camera(
         self, 
@@ -480,6 +555,7 @@ class GMAELoss(nn.Module):
         
         # Annealing factor
         alpha = min(1.0, self._iteration / max(self.warmup_iterations, 1))
+        beta = max(0.0, alpha - 0.5) * 2.0
 
         opacity = torch.sigmoid(out_g['opacity'])
         
@@ -493,7 +569,9 @@ class GMAELoss(nn.Module):
         else:
             loss_opacity = opacity.mean()
             loss_volume = log_volume.mean()
-        
-        sparsity_loss = alpha * loss_opacity + 0.02 * loss_volume
+        loss_volume = loss_volume/8.2  # 정규화 상수 (실험적으로 결정)
+        if loss_volume.item() > 1:
+            loss_volume = torch.clamp(loss_volume, max=1)
+        sparsity_loss = 1 - loss_opacity + 1 - loss_volume
 
-        return sparsity_loss * 0 #FIXME
+        return sparsity_loss
