@@ -1,53 +1,31 @@
 
-# Before the architecture of BlackWell
-    ### step 1
-    conda create -n gaussian_autoencoder python=3.12
 
-    ### step 2
-    conda activate gaussian_autoencoder
-    export TORCH_CUDA_ARCH_LIST="8.6"-> nvidia 그래픽카드에 맞는 ARCH 수정, ARCH 버전은 다음에서 확인 https://developer.nvidia.com/cuda-gpus
+### step 1
+conda create -n gaussian_autoencoder python=3.12
 
-    ### step 3
-    conda install -c conda-forge plyfile gxx_linux-64 gcc_linux-64 libxcrypt
-    conda install nvidia/label/cuda-11.8.0::cuda cudatoolkit=11.8
+### step 2
+conda activate gaussian_autoencoder
+export TORCH_CUDA_ARCH_LIST="8.6"-> nvidia 그래픽카드에 맞는 ARCH 수정, ARCH 버전은 다음에서 확인 https://developer.nvidia.com/cuda-gpus
 
-    ### step 4
-    pip install --upgrade pip setuptools wheel
-    pip install tqdm opencv-python joblib
+### step 3
+conda install -c conda-forge plyfile gxx_linux-64=13 gcc_linux-64=13 libxcrypt -> cuda 12.8은 13까지 지원
+conda install nvidia/label/cuda-12.8.1::cuda # 참조 https://anaconda.org/nvidia/cuda
 
-    ### step 5
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+### step 4
+pip install --upgrade pip setuptools wheel
 
-    ### step 6
-    pip install git+https://github.com/nerfstudio-project/gsplat.git
-    pip install --no-build-isolation git+https://github.com/MrNeRF/optimized-fused-ssim
+### step 5
+pip install torch torchvision -> torch 사이트가서 확인 필요
 
+### step 6
+pip install tqdm opencv-python
 
-# BlackWell
-    ### step 1
-    conda create -n gaussian_autoencoder python=3.12
+### step 6
+pip install git+https://github.com/nerfstudio-project/gsplat.git
+pip install --no-build-isolation git+https://github.com/MrNeRF/optimized-fused-ssim
 
-    ### step 2
-    conda activate gaussian_autoencoder
-    export TORCH_CUDA_ARCH_LIST="12.0"-> nvidia 그래픽카드에 맞는 ARCH 수정, ARCH 버전은 다음에서 확인 https://developer.nvidia.com/cuda-gpus
-
-    ### step 3
-    conda install -c conda-forge plyfile gxx_linux-64 gcc_linux-64 libxcrypt
-    conda install nvidia/label/cuda-12.8.1::cuda # 참조 https://anaconda.org/nvidia/cuda
-
-    ### step 4
-    pip install --upgrade pip setuptools wheel
-    pip install tqdm joblib
-
-    ### step 5
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-
-    ### step 7
-    pip install git+https://github.com/nerfstudio-project/gsplat.git
-    pip install --no-build-isolation git+https://github.com/MrNeRF/optimized-fused-ssim
-
-    ### step 9
-    pip install -e .
+### step 7
+pip install -e .
 
 
 
