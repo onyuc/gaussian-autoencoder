@@ -1,0 +1,102 @@
+
+# Before the architecture of BlackWell
+    ### step 1
+    conda create -n gaussian_autoencoder python=3.12
+
+    ### step 2
+    conda activate gaussian_autoencoder
+    export TORCH_CUDA_ARCH_LIST="8.6"-> nvidia 그래픽카드에 맞는 ARCH 수정, ARCH 버전은 다음에서 확인 https://developer.nvidia.com/cuda-gpus
+
+    ### step 3
+    conda install -c conda-forge plyfile gxx_linux-64 gcc_linux-64 libxcrypt
+    conda install nvidia/label/cuda-11.8.0::cuda cudatoolkit=11.8
+
+    ### step 4
+    pip install --upgrade pip setuptools wheel
+    pip install tqdm opencv-python joblib
+
+    ### step 5
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+    ### step 6
+    pip install git+https://github.com/nerfstudio-project/gsplat.git
+    pip install --no-build-isolation git+https://github.com/MrNeRF/optimized-fused-ssim
+
+
+# BlackWell
+    ### step 1
+    conda create -n gaussian_autoencoder python=3.12
+
+    ### step 2
+    conda activate gaussian_autoencoder
+    export TORCH_CUDA_ARCH_LIST="12.0"-> nvidia 그래픽카드에 맞는 ARCH 수정, ARCH 버전은 다음에서 확인 https://developer.nvidia.com/cuda-gpus
+
+    ### step 3
+    conda install -c conda-forge plyfile gxx_linux-64 gcc_linux-64 libxcrypt
+    conda install nvidia/label/cuda-12.8.1::cuda # 참조 https://anaconda.org/nvidia/cuda
+
+    ### step 4
+    pip install --upgrade pip setuptools wheel
+    pip install tqdm joblib
+
+    ### step 5
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+    ### step 7
+    pip install git+https://github.com/nerfstudio-project/gsplat.git
+    pip install --no-build-isolation git+https://github.com/MrNeRF/optimized-fused-ssim
+
+    ### step 9
+    pip install -e .
+
+
+
+# 1. 디렉토리 생성
+mkdir -p ~/miniconda3/envs/gaussian_autoencoder/etc/conda/activate.d
+mkdir -p ~/miniconda3/envs/gaussian_autoencoder/etc/conda/deactivate.d
+
+# 2. Activation 스크립트 생성
+# Activation 스크립트
+cat > ~/miniconda3/envs/gaussian_autoencoder/etc/conda/activate.d/env_vars.sh << 'EOF'
+#!/bin/bash
+export OLD_PATH=$PATH
+export OLD_CPATH=$CPATH
+export OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
+export OLD_CUDA_HOME=$CUDA_HOME
+
+export PATH=$CONDA_PREFIX/bin:$PATH
+export CUDA_HOME=$CONDA_PREFIX
+export CPATH=$CONDA_PREFIX/targets/x86_64-linux/include:$CPATH
+export LD_LIBRARY_PATH=$CONDA_PREFIX/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
+EOF
+
+# 3. Deactivation 스크립트 생성
+cat > ~/miniconda3/envs/freetimegs/etc/conda/deactivate.d/env_vars.sh << 'EOF'
+#!/bin/bash
+if [ -n "$OLD_PATH" ]; then
+    export PATH=$OLD_PATH
+    unset OLD_PATH
+fi
+if [ -n "$OLD_CPATH" ]; then
+    export CPATH=$OLD_CPATH
+    unset OLD_CPATH
+fi
+if [ -n "$OLD_LD_LIBRARY_PATH" ]; then
+    export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
+    unset OLD_LD_LIBRARY_PATH
+fi
+if [ -n "$OLD_CUDA_HOME" ]; then
+    export CUDA_HOME=$OLD_CUDA_HOME
+    unset OLD_CUDA_HOME
+else
+    unset CUDA_HOME
+fi
+EOF
+
+# 4. 실행 권한 부여
+chmod +x ~/miniconda3/envs/gaussian_autoencoder/etc/conda/activate.d/env_vars.sh
+chmod +x ~/miniconda3/envs/gaussian_autoencoder/etc/conda/deactivate.d/env_vars.sh
+
+# 5. 환경 재활성화
+conda deactivate
+conda activate gaussian_autoencoder
