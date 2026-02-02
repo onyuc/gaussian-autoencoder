@@ -14,9 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 
-
-# from fused_ssim import fused_ssim
 from gsplat import rasterization
+from gs_merge.utils.debug_utils import print_gaussian_stats
 
 
 class GMAELoss(nn.Module):
@@ -90,7 +89,13 @@ class GMAELoss(nn.Module):
         if self._debug_count % self.debug_save_interval == 0:
             warmup_status = f"WARMUP {self._iteration}/{self.warmup_iterations}" if self._iteration < self.warmup_iterations else "NORMAL"
             print(f"[{warmup_status}] Training mode")
-            self._print_debug_stats(input_g, output_g, loss_density, loss_render)
+            print_gaussian_stats(
+                input_g, output_g, 
+                loss_density, loss_render,
+                iteration=self._debug_count,
+                input_mask=input_mask,
+                output_mask=output_mask
+            )
         
         # Total Loss
         total_loss = (
@@ -105,69 +110,6 @@ class GMAELoss(nn.Module):
             "loss_sparsity": loss_sparsity.item(),
             "loss_total": total_loss.item()
         }
-
-    def _print_debug_stats(
-        self, 
-        input_g: Dict[str, torch.Tensor], 
-        output_g: Dict[str, torch.Tensor],
-        loss_density: torch.Tensor,
-        loss_render: torch.Tensor
-    ):
-        """Debug 통계 출력 (opacity > 0.005 필터링)"""
-        with torch.no_grad():
-            # Raw data
-            in_xyz = input_g['xyz']
-            in_scale_real = torch.exp(input_g['scale'])
-            in_opacity_real = torch.sigmoid(input_g['opacity'])
-            
-            out_xyz = output_g['xyz']
-            out_scale_real = torch.exp(output_g['scale'])
-            out_opacity_real = torch.sigmoid(output_g['opacity'])
-            
-            # Filter by opacity > 0.005
-            in_valid_mask = in_opacity_real.squeeze(-1) > 0.005
-            out_valid_mask = out_opacity_real.squeeze(-1) > 0.005
-            
-            # Count filtered
-            in_total = in_xyz.numel() // 3
-            out_total = out_xyz.numel() // 3
-            in_removed = in_total - in_valid_mask.sum().item()
-            out_removed = out_total - out_valid_mask.sum().item()
-            
-            # Apply filter
-            in_xyz_filtered = in_xyz[in_valid_mask]
-            in_scale_filtered = in_scale_real[in_valid_mask]
-            in_opacity_filtered = in_opacity_real.squeeze(-1)[in_valid_mask]
-            
-            out_xyz_filtered = out_xyz[out_valid_mask]
-            out_scale_filtered = out_scale_real[out_valid_mask]
-            out_opacity_filtered = out_opacity_real.squeeze(-1)[out_valid_mask]
-            
-            print(f"\n{'='*60}")
-            print(f"[DEBUG iter={self._debug_count}] Input vs Output 분포 (opacity > 0.005)")
-            print(f"{'='*60}")
-            print(f"  Filtered Gaussians:")
-            print(f"    Total Input(B, N):  {in_total} → {in_total - in_removed} (removed: {in_removed}, {in_removed/max(in_total, 1)*100:.1f}%)")
-            print(f"    Total Output(B, N): {out_total} → {out_total - out_removed} (removed: {out_removed}, {out_removed/max(out_total, 1)*100:.1f}%)")
-            
-            if in_xyz_filtered.numel() > 0 and out_xyz_filtered.numel() > 0:
-                print(f"  XYZ:")
-                print(f"    Input  - min: {in_xyz_filtered.min():.3f}, max: {in_xyz_filtered.max():.3f}, mean: {in_xyz_filtered.mean():.3f}")
-                print(f"    Output - min: {out_xyz_filtered.min():.3f}, max: {out_xyz_filtered.max():.3f}, mean: {out_xyz_filtered.mean():.3f}")
-                print(f"  Scale (실제값):")
-                print(f"    Input  - min: {in_scale_filtered.min():.4f}, max: {in_scale_filtered.max():.4f}, mean: {in_scale_filtered.mean():.4f}")
-                print(f"    Output - min: {out_scale_filtered.min():.4f}, max: {out_scale_filtered.max():.4f}, mean: {out_scale_filtered.mean():.4f}")
-                print(f"  Opacity (0~1):")
-                print(f"    Input  - min: {in_opacity_filtered.min():.3f}, max: {in_opacity_filtered.max():.3f}, mean: {in_opacity_filtered.mean():.3f}")
-                print(f"    Output - min: {out_opacity_filtered.min():.3f}, max: {out_opacity_filtered.max():.3f}, mean: {out_opacity_filtered.mean():.3f}")
-                print(f"  Opacity > 0.5 비율:")
-                print(f"    Input:  {(in_opacity_filtered > 0.5).float().mean()*100:.1f}%")
-                print(f"    Output: {(out_opacity_filtered > 0.5).float().mean()*100:.1f}%")
-            else:
-                print(f"  ⚠ No valid Gaussians after filtering!")
-                
-            print(f"  Losses: density={loss_density.item():.4f}, render={loss_render.item():.4f}")
-            print(f"{'='*60}\n")
 
     # =========================================================================
     # [1] Density Field Matching (KLD)
@@ -351,51 +293,42 @@ class GMAELoss(nn.Module):
             
             view_mat, K = self._get_random_camera(device, H, W, fov_y, radius=5.0)
             
-            img_in, alpha_in = self._render_with_gsplat(in_g_b, in_mask_b, view_mat, K, H, W)
-            img_out, alpha_out = self._render_with_gsplat(out_g_b, out_mask_b, view_mat, K, H, W)
+            # ========== 랜덤 배경 생성 ==========
+            # 1. 완전 랜덤 (RGB 각 채널 독립)
+            if torch.rand(1).item() < 0.5:
+                backgrounds = torch.rand(3, device=device)  # [3]
+            else:
+                # 2. 흑백 랜덤 (그레이스케일)
+                gray = torch.rand(1, device=device).item()
+                backgrounds = torch.tensor([gray, gray, gray], device=device)  # [3]
+
+            img_in, alpha_in = self._render_with_gsplat(in_g_b, in_mask_b, view_mat, K, H, W, backgrounds)
+            img_out, alpha_out = self._render_with_gsplat(out_g_b, out_mask_b, view_mat, K, H, W, backgrounds)
             
             # Debug 이미지 저장
             if b == 0:
                 self._render_call_count += 1
                 if self._render_call_count % self.debug_save_interval == 0:
                     n_in = (~in_mask_b).sum().item() if in_mask_b is not None else in_g_b['xyz'].shape[0]
-                    n_out = out_g_b['xyz'].shape[0]
+                    n_out = (~out_mask_b).sum().item() if out_mask_b is not None else out_g_b['xyz'].shape[0]
                     self._save_render_pair(img_in, img_out, n_in, n_out)
             
 
             if img_in.abs().sum() > 1e-6 or img_out.abs().sum() > 1e-6:
 
-                pixel_brightness_in = img_in.sum(dim=-1)
-                mask_rendered = (pixel_brightness_in > 0.01).float()
-                n_rendered = mask_rendered.sum() + 1e-6
+                # Alpha 값 자체를 가중치로 사용 (연속값)
+                # alpha_in: [1, H, W]
+                alpha_mask = (alpha_in > 0.001).squeeze(0)  # [H, W] = 0~1 연속값
+                n_rendered = alpha_mask.sum() + 1e-6
                 
                 diff = (img_out - img_in).abs()
-                loss_rendered_masked_l1 = (diff * mask_rendered.unsqueeze(-1)).sum() / (n_rendered * 3)
+                loss_rendered_masked_l1 = (diff * alpha_mask).sum() / (n_rendered * 3)
                 loss_rendered_l1 = F.l1_loss(img_out, img_in)
                 loss_rendered = 1.0 * loss_rendered_masked_l1 + 0.3 * loss_rendered_l1
                 
-                # loss_ssim = (1 - fused_ssim(
-                #     img_out.permute(2, 0, 1).unsqueeze(0),
-                #     img_in.permute(2, 0, 1).unsqueeze(0),
-                #     padding="valid"
-                # ))
-
-                mask_alpha = (alpha_in > 0.01).float()
-                n_alpha = mask_alpha.sum() + 1e-6
-                loss_alpha_masked_l1 = (F.l1_loss(alpha_out, alpha_in) * mask_alpha).sum() / n_alpha
                 loss_alpha_l1 = F.l1_loss(alpha_out.squeeze(), alpha_in.squeeze())
-                loss_alpha = 1 * loss_alpha_masked_l1 + 0.3 * loss_alpha_l1
 
-
-                # seed 가 될 pixel에 강력한 gradient이 흐르도록 유도
-                warmup = min(1.0, self._iteration / max(self.warmup_iterations, 1))
-                cooldown = 1.0 - warmup
-                
-                render_seed = (img_in.max() - img_out.max()).abs()
-                alpha_seed = (alpha_in.max() - alpha_out.max()).abs()
-                gaussian_seed = cooldown * (render_seed + alpha_seed)
-
-                total_loss += loss_rendered + loss_alpha + gaussian_seed * 1
+                total_loss += loss_rendered + loss_alpha_l1
                 valid_count += 1
         
         if valid_count == 0:
@@ -410,7 +343,8 @@ class GMAELoss(nn.Module):
         view_mat: torch.Tensor,
         K: torch.Tensor,
         H: int,
-        W: int
+        W: int,
+        backgrounds: torch.Tensor
     ) -> torch.Tensor:
         """단일 Voxel에 대해 gsplat 렌더링 수행"""
         device = g_dict['xyz'].device
@@ -430,7 +364,7 @@ class GMAELoss(nn.Module):
         sh = torch.cat([sh_dc_expanded, sh_higher], dim=1)
         
         # 값 범위 제한
-        scales = scales.clamp(min=1e-6, max=10.0)
+        scales = scales.clamp(min=1e-6, max=20.0)
         opacities = opacities.clamp(0.0, 1.0)
         quats = F.normalize(quats, dim=-1)
         
@@ -452,7 +386,7 @@ class GMAELoss(nn.Module):
         try:
             viewmats = view_mat.unsqueeze(0)
             Ks = K.unsqueeze(0)
-            
+
             render_colors, render_alphas, meta = rasterization(
                 means=means,
                 quats=quats,
@@ -467,6 +401,7 @@ class GMAELoss(nn.Module):
                 near_plane=0.01,
                 far_plane=100.0,
                 render_mode="RGB",
+                backgrounds=backgrounds
             )
             
             render_colors = render_colors.squeeze(0).clamp(0.0, 1.0)
@@ -544,34 +479,50 @@ class GMAELoss(nn.Module):
         out_mask: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """
-        출력 가우시안 Sparsity 정규화 (Annealing)
+        출력 가우시안 활용도 최대화 (Min-Value Penalty Loss)
+
+        선택된 모든 가우시안의 opacity와 scale이 0에 가까워지면 강한 페널티 부여
+        (quadratic penalty로 작은 값을 더 강하게 억제)
         
-        1. Opacity L1: 불필요한 Gaussian 억제
-        2. Volume Regularization: 큰 Scale 억제 (opacity * scale^3)
-        
-        초기: Sparsity 약하게 → 자유롭게 표현
-        후기: Sparsity 강하게 → 효율적인 표현 유도
+        Args:
+            out_g: 출력 가우시안 파라미터
+            out_mask: 패딩 마스크 (True=Invalid)
         """
         
-        # Annealing factor
-        alpha = min(1.0, self._iteration / max(self.warmup_iterations, 1))
-        beta = max(0.0, alpha - 0.5) * 2.0
-
-        opacity = torch.sigmoid(out_g['opacity'])
+        opacity = torch.sigmoid(out_g['opacity']).squeeze(-1)  # [B, M]
+        log_scale = out_g['scale']  # [B, M, 3], 이미 log scale (학습 파라미터)
         
-        # Volume: product of 3D scale
-        log_volume = out_g['scale'].sum(dim=-1, keepdim=True)
-        
+        # Valid mask 적용 (padding 제거)
         if out_mask is not None:
-            valid_mask = (~out_mask).unsqueeze(-1).float()
-            loss_opacity = (opacity * valid_mask).sum() / (valid_mask.sum() + 1e-6)
-            loss_volume = (log_volume * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+            valid_mask = ~out_mask
+            if valid_mask.sum() == 0:
+                return torch.tensor(0.0, device=opacity.device, requires_grad=True)
+            valid_opacity = opacity[valid_mask]
+            valid_log_scale = log_scale[valid_mask]
         else:
-            loss_opacity = opacity.mean()
-            loss_volume = log_volume.mean()
-        loss_volume = loss_volume/8.2  # 정규화 상수 (실험적으로 결정)
-        if loss_volume.item() > 1:
-            loss_volume = torch.clamp(loss_volume, max=1)
-        sparsity_loss = 1 - loss_opacity + 1 - loss_volume
+            valid_opacity = opacity
+            valid_log_scale = log_scale
+        
+        # log_scale 범위: [ln(1e-8), ln(20)] = [-18.4, 2.996]
+        log_scale = valid_log_scale.mean(dim=-1)  # [num_valid], 각 가우시안의 평균 scale
+        
+        # log_scale 공간에서 시그모이드 정규화 (각 가우시안별로 적용)
+        normalized_scale = torch.sigmoid(log_scale)  # [num_valid], 각 가우시안의 정규화된 scale
+                
+        # 0.3 이상이면 1로 설정 (gradient 안 받음)
+        valid_opacity_clamped = torch.clamp(valid_opacity, max=0.3)
 
-        return sparsity_loss
+        # 0.03 이상이면 1로 설정 (gradient 안 받음)
+        normalized_scale_clamped = torch.clamp(normalized_scale, max=0.03)
+        #clamp로 바꿔보는것도 테스트 하면 좋을듯
+
+        # Presence penalty: presence가 낮은 가우시안에 페널티
+        # presence_penalty = -1.0 * torch.log(presence + 1e-20).mean()
+        presence_penalty = -1.0 * (torch.log(valid_opacity_clamped + 1e-20) * 5 + torch.log(normalized_scale_clamped + 1e-20)).mean()
+        presence_penalty_bias = (1 - valid_opacity).mean() * 0.1
+        
+        # warmup = min(1.0, self._iteration / max(self.warmup_iterations, 1))
+        
+        utilization_loss = presence_penalty + presence_penalty_bias
+        
+        return utilization_loss

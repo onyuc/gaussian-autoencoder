@@ -99,12 +99,13 @@ def save_ply(
     """
     # GaussianData 객체가 주어진 경우 분해
     if gaussians is not None:
-        xyz = gaussians.xyz.cpu().numpy()
-        rotation = gaussians.rotation.cpu().numpy()
-        scale = gaussians.scale.cpu().numpy()
-        opacity = gaussians.opacity.cpu().numpy()
-        sh_dc = gaussians.sh_dc.cpu().numpy()
-        sh_rest = gaussians.sh_rest.cpu().numpy()
+        import torch
+        xyz = gaussians.xyz.cpu().numpy() if isinstance(gaussians.xyz, torch.Tensor) else gaussians.xyz
+        rotation = gaussians.rotation.cpu().numpy() if isinstance(gaussians.rotation, torch.Tensor) else gaussians.rotation
+        scale = gaussians.scale.cpu().numpy() if isinstance(gaussians.scale, torch.Tensor) else gaussians.scale
+        opacity = gaussians.opacity.cpu().numpy() if isinstance(gaussians.opacity, torch.Tensor) else gaussians.opacity
+        sh_dc = gaussians.sh_dc.cpu().numpy() if isinstance(gaussians.sh_dc, torch.Tensor) else gaussians.sh_dc
+        sh_rest = gaussians.sh_rest.cpu().numpy() if isinstance(gaussians.sh_rest, torch.Tensor) else gaussians.sh_rest
     
     N = xyz.shape[0]
     

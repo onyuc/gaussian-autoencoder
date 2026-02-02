@@ -32,7 +32,7 @@ class GaussianHeads(nn.Module):
         self.head_sh_rest = nn.Linear(latent_dim, sh_dim - 3)
         
 
-        self.max_scale = 15.0  # scale의 최대값 제한 (실제 scale = exp(output))
+        self.max_scale = 20.0  # scale의 최대값 제한 (실제 scale = exp(output))
     
     def forward(self, features: torch.Tensor) -> tuple:
         """

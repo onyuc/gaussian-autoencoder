@@ -32,10 +32,10 @@ def compress_ply(
     ply_path: str,
     checkpoint_path: str,
     output_path: str,
-    voxel_size: float = 0.5,
-    max_level: int = 6,
-    max_gaussians_per_voxel: int = 256,
-    num_queries: int = 32,
+    voxel_size: float = 100,
+    max_level: int = 16,
+    max_gaussians_per_voxel: int = 128,
+    num_queries: int = 128,
     opacity_threshold: float = 0.005,
     device: str = "cuda"
 ):
@@ -91,58 +91,78 @@ def compress_ply(
     print(f"\nCompressing voxels...")
     
     all_outputs = []
+    batch_size = 64  # 배치 크기 설정
+    all_outputs = []
     
     with torch.no_grad():
-        for voxel in tqdm(voxels, desc="Processing voxels"):
-            import math
-            # Voxel 내 Gaussian 추출 및 정규화
-            idx = voxel.indices
-            half_size = voxel.size / 2
+        for batch_start in tqdm(range(0, len(voxels), batch_size), desc="Processing batches"):
+            batch_voxels = voxels[batch_start:batch_start + batch_size]
+            B = len(batch_voxels)
             
-            xyz_norm = (gaussians.xyz[idx] - voxel.center) / half_size
-            xyz_norm = torch.clamp(xyz_norm, -1.0, 1.0)
-            scale_norm = gaussians.scale[idx] - math.log(half_size)
+            # 배치 입력 준비
+            batch_inputs = []
+            batch_levels = []
+            batch_padding_masks = []
             
-            # Input tensor [1, N, 59]
-            input_tensor = torch.cat([
-                xyz_norm,
-                gaussians.rotation[idx],
-                scale_norm,
-                gaussians.opacity[idx],
-                gaussians.sh_dc[idx],
-                gaussians.sh_rest[idx]
-            ], dim=-1).unsqueeze(0)
+            for voxel in batch_voxels:
+                import math
+                # Voxel 내 Gaussian 추출 및 정규화
+                idx = voxel.indices
+                half_size = voxel.size / 2
+                
+                xyz_norm = (gaussians.xyz[idx] - voxel.center) / half_size
+                xyz_norm = torch.clamp(xyz_norm, -1.0, 1.0)
+                scale_norm = gaussians.scale[idx] - math.log(half_size)
+                
+                # Input tensor [N, 59]
+                input_tensor = torch.cat([
+                    xyz_norm,
+                    gaussians.rotation[idx],
+                    scale_norm,
+                    gaussians.opacity[idx],
+                    gaussians.sh_dc[idx],
+                    gaussians.sh_rest[idx]
+                ], dim=-1)
+                
+                # Padding
+                N = input_tensor.shape[0]
+                if N < max_gaussians_per_voxel:
+                    padding = torch.zeros(max_gaussians_per_voxel - N, 59, device=device)
+                    input_tensor = torch.cat([input_tensor, padding], dim=0)
+                    padding_mask = torch.zeros(max_gaussians_per_voxel, dtype=torch.bool, device=device)
+                    padding_mask[N:] = True
+                else:
+                    input_tensor = input_tensor[:max_gaussians_per_voxel]
+                    padding_mask = torch.zeros(max_gaussians_per_voxel, dtype=torch.bool, device=device)
+                
+                batch_inputs.append(input_tensor)
+                batch_levels.append(voxel.level)
+                batch_padding_masks.append(padding_mask)
             
-            # Level
-            voxel_level = torch.tensor([voxel.level], device=device)
-            
-            # Padding
-            N = input_tensor.shape[1]
-            if N < max_gaussians_per_voxel:
-                padding = torch.zeros(1, max_gaussians_per_voxel - N, 59, device=device)
-                input_tensor = torch.cat([input_tensor, padding], dim=1)
-                padding_mask = torch.zeros(1, max_gaussians_per_voxel, dtype=torch.bool, device=device)
-                padding_mask[0, N:] = True
-            else:
-                input_tensor = input_tensor[:, :max_gaussians_per_voxel]
-                padding_mask = None
+            # Stack to batch tensors
+            batch_inputs = torch.stack(batch_inputs, dim=0)  # [B, N, 59]
+            batch_levels = torch.tensor(batch_levels, device=device)  # [B]
+            batch_padding_masks = torch.stack(batch_padding_masks, dim=0)  # [B, N]
             
             # Model forward
-            xyz_out, rot_out, scale_out, opacity_out, sh_out = model(
-                input_tensor, voxel_level, padding_mask
+            xyz_out, rot_out, scale_out, opacity_out, sh_out, output_mask = model(
+                batch_inputs, batch_levels, batch_padding_masks
             )
             
-            # [1, M, *] -> [M, *]
-            output = {
-                'xyz': xyz_out.squeeze(0),
-                'rotation': rot_out.squeeze(0),
-                'scale': scale_out.squeeze(0),
-                'opacity': opacity_out.squeeze(0),
-                'sh_dc': sh_out.squeeze(0)[..., :3],
-                'sh_rest': sh_out.squeeze(0)[..., 3:]
-            }
-            
-            all_outputs.append(output)
+            # 배치별로 결과 분리 및 필터링
+            for i in range(B):
+                valid_mask = ~output_mask[i]  # [M], True=유효
+                
+                output = {
+                    'xyz': xyz_out[i][valid_mask],
+                    'rotation': rot_out[i][valid_mask],
+                    'scale': scale_out[i][valid_mask],
+                    'opacity': opacity_out[i][valid_mask],
+                    'sh_dc': sh_out[i][valid_mask][..., :3],
+                    'sh_rest': sh_out[i][valid_mask][..., 3:]
+                }
+                
+                all_outputs.append(output)
     
     # =========================================
     # 4. Merge All Voxels
@@ -170,10 +190,10 @@ def main():
     parser.add_argument("--ply", type=str, required=True, help="Input PLY file path")
     parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint path")
     parser.add_argument("--output", type=str, required=True, help="Output PLY file path")
-    parser.add_argument("--voxel_size", type=float, default=0.5, help="Initial voxel size")
-    parser.add_argument("--max_level", type=int, default=6, help="Max octree level")
-    parser.add_argument("--max_gaussians", type=int, default=256, help="Max gaussians per voxel")
-    parser.add_argument("--num_queries", type=int, default=32, help="Output gaussians per voxel")
+    parser.add_argument("--voxel_size", type=float, default=100, help="Initial voxel size")
+    parser.add_argument("--max_level", type=int, default=16, help="Max octree level")
+    parser.add_argument("--max_gaussians", type=int, default=128, help="Max gaussians per voxel")
+    parser.add_argument("--num_queries", type=int, default=128, help="Output gaussians per voxel")
     parser.add_argument("--opacity_threshold", type=float, default=0.005, help="Min opacity to keep")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     

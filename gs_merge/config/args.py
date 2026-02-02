@@ -107,6 +107,49 @@ def get_training_parser() -> argparse.ArgumentParser:
         help="Number of decoder layers"
     )
     
+    # Gumbel Noise Scheduling arguments
+    gumbel_group = parser.add_argument_group('gumbel', 'Gumbel noise scheduling for query selection')
+    gumbel_group.add_argument(
+        "--gumbel_initial_scale", 
+        type=float, 
+        default=None,
+        help="Initial gumbel noise scale (higher = more exploration)"
+    )
+    gumbel_group.add_argument(
+        "--gumbel_final_scale", 
+        type=float, 
+        default=None,
+        help="Final gumbel noise scale (0 = deterministic selection)"
+    )
+    gumbel_group.add_argument(
+        "--gumbel_warmup_epochs", 
+        type=int, 
+        default=None,
+        help="Epochs to keep initial noise scale before annealing"
+    )
+    gumbel_group.add_argument(
+        "--gumbel_schedule_type", 
+        type=str, 
+        default=None,
+        choices=["linear", "cosine", "exponential", "warmup_cosine", "constant"],
+        help="Type of noise annealing schedule"
+    )
+    
+    # Compression Ratio arguments
+    compression_group = parser.add_argument_group('compression', 'Compression ratio scheduling')
+    compression_group.add_argument(
+        "--compression_ratio_min", 
+        type=float, 
+        default=None,
+        help="Minimum compression ratio for random sampling (0.0 ~ 1.0)"
+    )
+    compression_group.add_argument(
+        "--compression_ratio_max", 
+        type=float, 
+        default=None,
+        help="Maximum compression ratio for random sampling (0.0 ~ 1.0)"
+    )
+    
     # Training arguments
     train_group = parser.add_argument_group('training', 'Training hyperparameters')
     train_group.add_argument(
@@ -271,6 +314,14 @@ def _set_fallback_defaults(args: argparse.Namespace) -> None:
         'save_dir': './checkpoints',
         'save_interval': 10,
         'debug_save_interval': 100,
+        # Gumbel noise scheduling defaults
+        'gumbel_initial_scale': 0.5,
+        'gumbel_final_scale': 0.0,
+        'gumbel_warmup_epochs': 10,
+        'gumbel_schedule_type': 'warmup_cosine',
+        # Compression ratio defaults
+        'compression_ratio_min': 0.1,
+        'compression_ratio_max': 1.0,
     }
     
     for key, value in defaults.items():

@@ -12,7 +12,7 @@ data:
 model:
   input_dim: 59
   latent_dim: 256
-  num_queries: 64
+  num_queries: 128
   nhead: 8
   num_enc_layers: 4
   num_dec_layers: 4
@@ -30,14 +30,14 @@ loss:
   type: "gmae"  # or "chamfer"
   lambda_density: 1.0
   lambda_render: 10.0
-  lambda_sparsity: 0.01
+  lambda_sparsity: 0.1
   lambda_attr: 0.5
   n_density_samples: 1024
-  render_resolution: 64
+  render_resolution: 256
   warmup_iterations: 100000
 
 # Output
 output:
-  save_dir: "./checkpoints/test_opacity_grow"
+  save_dir: "./checkpoints/rand_background_hinge"
   save_interval: 100
   debug_save_interval: 100

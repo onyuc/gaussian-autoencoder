@@ -38,11 +38,11 @@ def denormalize_gaussian(
     # xyz: 정규화 좌표 → 월드 좌표
     world_xyz = output['xyz'] * half_size + voxel.center
     
-    # scale: log space + voxel 오프셋 → 실제 값
-    world_scale = torch.exp(output['scale'] + math.log(half_size))
+    # scale: 정규화된 log scale → 월드 log scale (PLY는 log space로 저장)
+    world_scale = output['scale'] + math.log(half_size)
     
-    # opacity: logit → sigmoid
-    world_opacity = torch.sigmoid(output['opacity'])
+    # opacity: 모델 출력은 logit space 그대로 유지 (PLY도 logit space로 저장)
+    world_opacity = output['opacity']
     
     return {
         'xyz': world_xyz,
@@ -84,12 +84,13 @@ def merge_gaussians_from_voxels(
         # Denormalize
         world_g = denormalize_gaussian(output, voxel)
         
-        # Opacity filtering
-        opacity = world_g['opacity'].squeeze(-1)
-        total_count += opacity.shape[0]
+        # Opacity filtering (logit space → sigmoid 적용해서 비교)
+        opacity_logit = world_g['opacity'].squeeze(-1)
+        opacity_prob = torch.sigmoid(opacity_logit)
+        total_count += opacity_prob.shape[0]
         
         if opacity_threshold > 0:
-            valid_mask = opacity >= opacity_threshold
+            valid_mask = opacity_prob >= opacity_threshold
             filtered_count += (~valid_mask).sum().item()
             
             if valid_mask.sum() == 0:
@@ -154,7 +155,7 @@ def save_merged_ply(
         sh_rest=merged_gaussians['sh_rest']
     )
     
-    save_ply(gaussians, str(output_path))
+    save_ply(str(output_path), gaussians)
     
     if verbose:
         print(f"  ✅ Saved {gaussians.num_gaussians:,} Gaussians to {output_path}")

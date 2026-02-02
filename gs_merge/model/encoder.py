@@ -29,7 +29,7 @@ class PositionalEncoding(nn.Module):
 class FourierPositionalEncoding(nn.Module):
     """Fixed Fourier Feature Positional Encoding"""
     
-    def __init__(self, d_model: int, num_frequencies: int = 10):
+    def __init__(self, d_model: int, num_frequencies: int = 8):
         super().__init__()
         self.d_model = d_model
         self.num_frequencies = num_frequencies
@@ -62,3 +62,50 @@ class FourierPositionalEncoding(nn.Module):
         features = torch.cat([xyz, fourier], dim=-1)  # [B, N, 3 + 6F]
         
         return self.proj(features)
+
+
+class RatioEncoding(nn.Module):
+    """Compression Ratio Encoding
+    
+    Supports both [B] and [B, 1] input shapes
+    """
+    
+    def __init__(self, d_model: int, num_frequencies: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.num_frequencies = num_frequencies
+        
+        # Frequency bands
+        freqs = 2.0 ** torch.linspace(0, num_frequencies - 1, num_frequencies)
+        self.register_buffer('freqs', freqs)
+        
+        # Project from fourier features to d_model
+        fourier_dim = num_frequencies * 2  # sin + cos for each dim
+        self.mlp = nn.Linear(fourier_dim + 1, d_model)
+    
+    def forward(self, ratio: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            ratio: [B] or [B, 1] compression ratio
+        Returns:
+            [B, d_model] positional features
+        """
+        # Normalize to [B, 1] if needed
+        if ratio.dim() == 1:
+            ratio = ratio.unsqueeze(-1)  # [B] -> [B, 1]
+        
+        # Fourier features with NeRF-style pi scaling
+        ratio_freq = ratio * self.freqs * torch.pi  # [B, 1, F]
+        sin_feat = torch.sin(ratio_freq)
+        cos_feat = torch.cos(ratio_freq)
+        
+        # Flatten and concat
+        fourier = torch.cat([sin_feat, cos_feat], dim=-1)  # [B, 1, 2F]
+        fourier = fourier.squeeze(1)  # [B, 2F]
+        
+        # Concat with raw ratio
+        ratio_val = ratio.squeeze(-1)  # [B]
+        features = torch.cat([ratio_val.unsqueeze(-1), fourier], dim=-1)  # [B, 1 + 2F]
+        
+        return self.mlp(features)  # [B, d_model]
+    
