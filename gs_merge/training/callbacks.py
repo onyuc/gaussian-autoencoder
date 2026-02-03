@@ -235,3 +235,99 @@ class LoggingCallback(Callback):
         if self.log_to_file and self.log_path:
             with open(self.log_path, 'a') as f:
                 f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{lr:.8f},{gumbel:.4f}\n")
+
+
+class TensorBoardCallback(Callback):
+    """
+    TensorBoard 로깅 콜백
+    
+    Args:
+        log_dir: TensorBoard 로그 디렉토리
+        log_histograms: 히스토그램 로깅 여부 (가우시안 분포 등)
+        log_interval: 배치 레벨 로깅 간격 (0이면 epoch만)
+    """
+    
+    def __init__(
+        self,
+        log_dir: str = "./runs",
+        log_histograms: bool = True,
+        log_interval: int = 0
+    ):
+        self.log_dir = log_dir
+        self.log_histograms = log_histograms
+        self.log_interval = log_interval
+        self.writer = None
+    
+    def on_train_begin(self, trainer, **kwargs):
+        """TensorBoard SummaryWriter 초기화"""
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            self.writer = SummaryWriter(log_dir=self.log_dir)
+            if trainer.is_main_process:
+                print(f"TensorBoard logging to: {self.log_dir}")
+        except ImportError:
+            if trainer.is_main_process:
+                print("Warning: TensorBoard not installed. Run: pip install tensorboard")
+            self.writer = None
+    
+    def on_train_end(self, trainer, **kwargs):
+        """TensorBoard writer 종료"""
+        if self.writer is not None:
+            self.writer.close()
+    
+    def on_batch_end(self, trainer, batch_idx, loss, **kwargs):
+        """배치 단위 로깅은 사용하지 않음 (epoch 기반만 사용)"""
+        pass
+    
+    def on_epoch_end(self, trainer, epoch, metrics, **kwargs):
+        """에폭 단위 로깅"""
+        if self.writer is None or not trainer.is_main_process:
+            return
+        
+        # Loss 로깅
+        for key, value in metrics.items():
+            if 'loss' in key:
+                # train_loss_total -> Loss/train/total
+                parts = key.split('_')
+                if parts[0] in ['train', 'val']:
+                    category = parts[0]
+                    metric_name = '_'.join(parts[1:])
+                    self.writer.add_scalar(f'Loss/{category}/{metric_name}', value, epoch)
+                else:
+                    self.writer.add_scalar(f'Loss/{key}', value, epoch)
+        
+        # Learning rate 로깅
+        if trainer.scheduler:
+            lr = trainer.scheduler.get_last_lr()[0]
+            self.writer.add_scalar('Training/learning_rate', lr, epoch)
+        
+        # Gumbel noise scale 로깅
+        if hasattr(trainer, 'gumbel_scheduler') and trainer.gumbel_scheduler:
+            gumbel_scale = trainer.gumbel_scheduler.get_scale()
+            self.writer.add_scalar('Training/gumbel_scale', gumbel_scale, epoch)
+        
+        # 가우시안 통계 로깅 (loss_dict에서 추출)
+        for key, value in metrics.items():
+            # 입력 가우시안 통계
+            if key.startswith('train_input_'):
+                metric_name = key.replace('train_input_', '')
+                self.writer.add_scalar(f'Gaussian/Input/{metric_name}', value, epoch)
+            # 출력 가우시안 통계
+            elif key.startswith('train_output_'):
+                metric_name = key.replace('train_output_', '')
+                self.writer.add_scalar(f'Gaussian/Output/{metric_name}', value, epoch)
+            # 레거시 지원 (prefix 없는 경우)
+            elif ('opacity' in key or 'scale' in key or 'gaussian' in key) and 'train' in key:
+                metric_name = key.replace('train_', '')
+                self.writer.add_scalar(f'Gaussian/{metric_name}', value, epoch)
+        
+        # 히스토그램 로깅 (debug_info에서 추출, kwargs로 전달된 경우)
+        if self.log_histograms and 'debug_info' in kwargs:
+            debug_info = kwargs['debug_info']
+            if 'histograms' in debug_info:
+                for name, tensor in debug_info['histograms'].items():
+                    # input_opacity, output_opacity 등으로 이름이 구분됨
+                    self.writer.add_histogram(f'Distribution/{name}', tensor, epoch)
+        
+        self.writer.flush()
+

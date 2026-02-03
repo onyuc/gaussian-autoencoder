@@ -70,11 +70,19 @@ class Trainer:
         # Accelerate for Multi-GPU
         accelerator: Optional[Any] = None,
         use_accelerate: bool = False,
+        # Debug rendering settings
+        debug_save_dir: str = "./debug_renders",
+        debug_save_epochs: int = 5,  # epoch 기반으로 변경
     ):
         self.use_accelerate = use_accelerate and ACCELERATE_AVAILABLE
         self.accelerator = accelerator
         self.grad_clip = grad_clip
         self.max_epochs = max_epochs
+        
+        # Debug settings
+        self.debug_save_dir = debug_save_dir
+        self.debug_save_epochs = debug_save_epochs
+        self._debug_render_count = 0
         
         # Accelerate 사용 시
         if self.use_accelerate and self.accelerator is not None:
@@ -134,6 +142,9 @@ class Trainer:
         self.compression_ratio_min = 0.1
         self.compression_ratio_max = 1.0
         
+        # Loss function
+        self.criterion = criterion
+        
         # Callbacks
         self.callbacks = CallbackList(callbacks)
         
@@ -173,6 +184,8 @@ class Trainer:
         
         # 메인 프로세스에서만 progress bar 표시
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}", disable=not self.is_main_process)
+        debug_info_collected = None
+        
         for batch_idx, batch in enumerate(pbar):
             self.callbacks.on_batch_begin(self, batch_idx)
             
@@ -180,8 +193,13 @@ class Trainer:
             if not self.use_accelerate:
                 batch = self._move_batch_to_device(batch)
             
-            # Forward
-            loss, loss_dict = self._forward_step(batch)
+            # Forward (디버그 정보는 첫 번째 배치에서만 수집)
+            should_collect_debug = (batch_idx == 0 and epoch % self.debug_save_epochs == 0)
+            
+            if should_collect_debug:
+                loss, loss_dict, debug_info_collected = self._forward_step(batch, return_debug_info=True)
+            else:
+                loss, loss_dict = self._forward_step(batch)
             
             # Backward
             self.optimizer.zero_grad()
@@ -220,6 +238,13 @@ class Trainer:
                 tensor = torch.tensor(avg_losses[k], device=self.device)
                 tensor = self.accelerator.reduce(tensor, reduction="mean")
                 avg_losses[k] = tensor.item()
+        
+        # Debug 이미지 저장 (epoch 기반)
+        if debug_info_collected is not None and self.is_main_process:
+            self._save_debug_renders(debug_info_collected, epoch)
+        
+        # Callback에 debug_info 전달
+        self.callbacks.on_epoch_end(self, epoch, avg_losses, debug_info=debug_info_collected)
         
         return avg_losses
     
@@ -264,7 +289,7 @@ class Trainer:
             return batch.to(self.device)
         return batch
     
-    def _forward_step(self, batch) -> tuple:
+    def _forward_step(self, batch, return_debug_info: bool = False) -> tuple:
         """Forward 스텝 - 서브클래스에서 오버라이드 가능"""
         # Default: (data, levels, masks) 형태
         if isinstance(batch, (list, tuple)) and len(batch) == 3:
@@ -288,8 +313,14 @@ class Trainer:
                 input_dict = parse_gaussian_tensor(data)
                 output_dict = model_output_to_dict(pred_xyz, pred_rot, pred_scale, pred_opacity, pred_sh)
                 
-                loss, loss_dict = self.criterion(input_dict, output_dict, input_mask=masks, output_mask=tgt_mask)
-                return loss, loss_dict
+                if return_debug_info:
+                    loss, loss_dict, debug_info = self.criterion(
+                        input_dict, output_dict, input_mask=masks, output_mask=tgt_mask, return_debug_info=True
+                    )
+                    return loss, loss_dict, debug_info
+                else:
+                    loss, loss_dict = self.criterion(input_dict, output_dict, input_mask=masks, output_mask=tgt_mask)
+                    return loss, loss_dict
         
         raise NotImplementedError("Override _forward_step for custom batch handling")
     
@@ -334,10 +365,6 @@ class Trainer:
             
             # Metrics
             all_metrics = {**train_metrics, **val_metrics}
-            
-            # Callbacks (메인 프로세스에서만)
-            if self.is_main_process:
-                self.callbacks.on_epoch_end(self, epoch, all_metrics)
             
             # Logging (메인 프로세스에서만)
             if self.is_main_process:
@@ -418,3 +445,39 @@ class Trainer:
         self.val_history = checkpoint.get('val_history', [])
         
         return self.current_epoch
+    
+    def _save_debug_renders(self, debug_info: Dict, epoch: int):
+        """디버그 렌더링 이미지 저장 (epoch 기반)"""
+        if not debug_info or 'renders' not in debug_info:
+            return
+            
+        renders = debug_info['renders']
+        if not renders:
+            return
+            
+        from PIL import Image
+        import numpy as np
+        import os
+        
+        os.makedirs(self.debug_save_dir, exist_ok=True)
+        
+        for render_info in renders:
+            idx = self._debug_render_count
+            self._debug_render_count += 1
+            
+            img_in = render_info['img_in']  # [H, W, 3]
+            img_out = render_info['img_out']  # [H, W, 3]
+            n_in = render_info['n_in']
+            n_out = render_info['n_out']
+            
+            # Convert to uint8
+            img_in_np = (img_in.clamp(0, 1).numpy() * 255).astype(np.uint8)
+            img_out_np = (img_out.clamp(0, 1).numpy() * 255).astype(np.uint8)
+            combined = np.concatenate([img_in_np, img_out_np], axis=1)
+            
+            # Save images
+            Image.fromarray(img_in_np).save(f"{self.debug_save_dir}/epoch_{epoch:03d}_render_{idx:04d}_input.png")
+            Image.fromarray(img_out_np).save(f"{self.debug_save_dir}/epoch_{epoch:03d}_render_{idx:04d}_output.png")  
+            Image.fromarray(combined).save(f"{self.debug_save_dir}/epoch_{epoch:03d}_render_{idx:04d}_combined.png")
+            
+            self.print_main(f"[debug] Saved epoch {epoch} render #{idx} (input: {n_in} gs, output: {n_out} gs)")

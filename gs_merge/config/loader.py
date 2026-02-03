@@ -81,7 +81,17 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     # Output config
     merged.save_dir = config['output']['save_dir']
     merged.save_interval = config['output']['save_interval']
-    merged.debug_save_interval = config['output']['debug_save_interval']
+    merged.debug_save_epochs = config['output'].get('debug_save_epochs', 5)  # epoch 기반으로 변경
+    merged.debug_save_dir = config['output'].get('debug_save_dir', './debug_renders')
+    
+    # TensorBoard config
+    if 'tensorboard' in config:
+        merged.use_tensorboard = config['tensorboard'].get('enabled', False)
+        merged.tensorboard_dir = config['tensorboard'].get('log_dir', './runs')
+        merged.tensorboard_log_histograms = config['tensorboard'].get('log_histograms', True)
+        merged.tensorboard_log_interval = config['tensorboard'].get('log_interval', 0)
+    else:
+        merged.use_tensorboard = False
     
     # Override with command-line args (if provided and not None)
     for key, value in vars(args).items():

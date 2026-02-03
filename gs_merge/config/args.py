@@ -23,9 +23,10 @@ def get_training_parser() -> argparse.ArgumentParser:
     # Required arguments
     parser.add_argument(
         "--ply", 
-        type=str, 
+        type=str,
+        nargs='+',
         required=True, 
-        help="Path to input PLY file with Gaussian point cloud"
+        help="Path to input PLY file(s) with Gaussian point cloud (one or more files)"
     )
     
     # Config
@@ -348,7 +349,13 @@ def _set_fallback_defaults(args: argparse.Namespace) -> None:
         'warmup_iterations': 200,
         'save_dir': './checkpoints',
         'save_interval': 10,
-        'debug_save_interval': 100,
+        'debug_save_epochs': 5,
+        'debug_save_dir': './debug_renders',
+        # TensorBoard
+        'use_tensorboard': True,
+        'tensorboard_dir': './runs',
+        'tensorboard_log_histograms': True,
+        'tensorboard_log_interval': 0,
         # Gumbel noise scheduling defaults
         'gumbel_initial_scale': 0.5,
         'gumbel_final_scale': 0.0,

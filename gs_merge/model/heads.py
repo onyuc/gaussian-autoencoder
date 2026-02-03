@@ -53,9 +53,7 @@ class GaussianHeads(nn.Module):
         rot = F.normalize(self.head_rot(features), dim=-1)
         
         # Scale: log space (실제 scale = exp(출력)), 최대값 제한
-        normalized_scale = torch.sigmoid(self.head_scale(features))
-        target_scale = normalized_scale * self.max_scale + 1e-8 # 0이 되지 않게 안전장치
-        scale = torch.log(target_scale)
+        scale = self.head_scale(features).clamp(min=-20.0, max=3.0)
         
         # Opacity: logit space (실제 opacity = sigmoid(출력))
         opacity = self.head_opacity(features)

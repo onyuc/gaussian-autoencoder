@@ -5,7 +5,7 @@ data:
   voxel_size: 100.0
   max_level: 16
   min_gaussians: 128
-  max_gaussians: 1024
+  max_gaussians: 512
   val_split: 0.1
   num_workers: 4  # DataLoader workers per GPU
   pin_memory: true
@@ -14,7 +14,7 @@ data:
 model:
   input_dim: 59
   latent_dim: 256
-  num_queries: 1024
+  num_queries: 512
   nhead: 8
   num_enc_layers: 4
   num_dec_layers: 4
@@ -42,12 +42,19 @@ loss:
   lambda_render: 10.0
   lambda_sparsity: 0.1
   lambda_attr: 0.5
-  n_density_samples: 1024
+  n_density_samples: 4096
   render_resolution: 256
   warmup_iterations: 100000
 
 # Output
 output:
-  save_dir: "/scratch/rchkl2380/Workspace/gaussian-autoencoder/checkpoints/ssim_1024"
+  save_dir: "/scratch/rchkl2380/Workspace/gaussian-autoencoder/checkpoints/ssim_512_std"
   save_interval: 100
-  debug_save_interval: 100
+  debug_save_dir: "/scratch/rchkl2380/Workspace/gaussian-autoencoder/checkpoints/ssim_512_std/debug_renders"
+  debug_save_epochs: 1
+# TensorBoard
+tensorboard:
+  enabled: true
+  log_dir: ""  # 비어있으면 save_dir/tensorboard 사용
+  log_histograms: true
+  log_interval: 0  # 0=epoch only, >0=batch level

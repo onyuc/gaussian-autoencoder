@@ -16,6 +16,7 @@ from gs_merge.training.callbacks import (
     CheckpointCallback,
     EarlyStoppingCallback,
     LoggingCallback,
+    TensorBoardCallback,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "CheckpointCallback",
     "EarlyStoppingCallback",
     "LoggingCallback",
+    "TensorBoardCallback",
 ]

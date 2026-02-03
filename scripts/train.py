@@ -47,6 +47,7 @@ from gs_merge.training import (
     CheckpointCallback,
     EarlyStoppingCallback,
     LoggingCallback,
+    TensorBoardCallback,
 )
 
 
@@ -74,9 +75,7 @@ def setup_criterion(args, save_dir: str):
             lambda_sparsity=getattr(args, 'lambda_sparsity', 0.01),
             n_density_samples=getattr(args, 'n_density_samples', 1024),
             render_resolution=getattr(args, 'render_resolution', 64),
-            warmup_iterations=getattr(args, 'warmup_iterations', 1000),
-            debug_save_dir=os.path.join(save_dir, "debug_renders"),
-            debug_save_interval=getattr(args, 'debug_save_interval', 100)
+            warmup_iterations=getattr(args, 'warmup_iterations', 1000)
         )
     else:
         return ChamferLoss()
@@ -86,43 +85,56 @@ def setup_data(args, device: str, accelerator=None):
     """데이터 로더 생성"""
     is_main = accelerator is None or accelerator.is_main_process
     
-    # Load PLY
-    if is_main:
-        print(f"\nLoading PLY: {args.ply}")
-    gaussians = load_ply(args.ply, device=device)
-    if is_main:
-        print(f"  Loaded {gaussians.num_gaussians:,} gaussians")
+    # PLY 파일 목록 처리 (단일 또는 여러 개)
+    ply_files = args.ply if isinstance(args.ply, list) else [args.ply]
     
-    # Voxelize
+    all_voxel_data = []  # (voxel, gaussians) 튜플 리스트
+    
+    for ply_path in ply_files:
+        # Load PLY
+        if is_main:
+            print(f"\nLoading PLY: {ply_path}")
+        gaussians = load_ply(ply_path, device=device)
+        if is_main:
+            print(f"  Loaded {gaussians.num_gaussians:,} gaussians")
+        
+        # Voxelize
+        if is_main:
+            print(f"  Voxelizing...")
+        voxelizer = OctreeVoxelizer(
+            voxel_size=args.voxel_size,
+            max_level=args.max_level,
+            min_gaussians=getattr(args, 'min_gaussians', 8),
+            max_gaussians=args.max_gaussians,
+            compact_threshold=0.5,
+            device=device,
+            cache_dir=args.cache_dir
+        )
+        voxels = voxelizer.voxelize_or_load(gaussians, ply_path, force_rebuild=args.force_rebuild)
+        if is_main:
+            print(f"  Created {len(voxels)} voxels")
+        
+        # 각 voxel에 해당 gaussians 객체 매핑
+        for voxel in voxels:
+            all_voxel_data.append((voxel, gaussians))
+    
     if is_main:
-        print(f"\nVoxelizing...")
-    voxelizer = OctreeVoxelizer(
-        voxel_size=args.voxel_size,
-        max_level=args.max_level,
-        min_gaussians=getattr(args, 'min_gaussians', 8),
-        max_gaussians=args.max_gaussians,
-        compact_threshold=0.5,
-        device=device,
-        cache_dir=args.cache_dir
-    )
-    voxels = voxelizer.voxelize_or_load(gaussians, args.ply, force_rebuild=args.force_rebuild)
-    if is_main:
-        print(f"  Created {len(voxels)} voxels")
+        print(f"\nTotal voxels from {len(ply_files)} file(s): {len(all_voxel_data)}")
     
     # Train/Val split
-    random.shuffle(voxels)
-    n_val = int(len(voxels) * args.val_split)
-    train_voxels = voxels[n_val:]
-    val_voxels = voxels[:n_val]
+    random.shuffle(all_voxel_data)
+    n_val = int(len(all_voxel_data) * args.val_split)
+    train_voxel_data = all_voxel_data[n_val:]
+    val_voxel_data = all_voxel_data[:n_val]
     
     if is_main:
         print(f"\nDataset split:")
-        print(f"  Train: {len(train_voxels)} voxels")
-        print(f"  Val: {len(val_voxels)} voxels")
+        print(f"  Train: {len(train_voxel_data)} voxels")
+        print(f"  Val: {len(val_voxel_data)} voxels")
     
-    # Create datasets
-    train_dataset = VoxelDataset(gaussians, train_voxels, args.max_gaussians)
-    val_dataset = VoxelDataset(gaussians, val_voxels, args.max_gaussians)
+    # Create datasets (이제 (voxel, gaussians) 튜플 리스트를 받음)
+    train_dataset = VoxelDataset(train_voxel_data, args.max_gaussians)
+    val_dataset = VoxelDataset(val_voxel_data, args.max_gaussians)
     
     # DataLoader 설정
     num_workers = getattr(args, 'num_workers', 0)
@@ -164,6 +176,22 @@ def setup_callbacks(args, is_main_process: bool = True) -> list:
             log_path=os.path.join(args.save_dir, "training.log")
         ),
     ]
+    
+    # TensorBoard logging (선택적)
+    if getattr(args, 'use_tensorboard', False):
+        tensorboard_dir = getattr(args, 'tensorboard_dir', '')
+        if not tensorboard_dir:
+            # save_dir 이름을 run name으로 사용
+            run_name = os.path.basename(args.save_dir.rstrip('/'))
+            tensorboard_dir = os.path.join(args.save_dir, 'tensorboard', run_name)
+        callbacks.append(
+            TensorBoardCallback(
+                log_dir=tensorboard_dir,
+                log_histograms=getattr(args, 'tensorboard_log_histograms', True),
+                log_interval=getattr(args, 'tensorboard_log_interval', 0)
+            )
+        )
+        print(f"TensorBoard enabled: {tensorboard_dir}")
     
     # Early stopping (optional)
     if getattr(args, 'early_stopping_patience', 0) > 0:
@@ -245,6 +273,9 @@ def main():
         # Multi-GPU support
         accelerator=accelerator,
         use_accelerate=use_accelerate,
+        # Debug settings
+        debug_save_dir=getattr(args, 'debug_save_dir', './debug_renders'),
+        debug_save_epochs=getattr(args, 'debug_save_epochs', 5),
     )
     
     # Set compression ratio range (배치마다 랜덤 샘플링)

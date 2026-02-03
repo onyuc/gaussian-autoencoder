@@ -1,0 +1,40 @@
+=============================================================================
+프로젝트 리팩터링 완료 (2026-02-03)
+=============================================================================
+
+✅ 주요 변경사항:
+
+1. 문서 정리
+   - 새 폴더: docs/
+   - 이동: TENSORBOARD.md, MULTI_PLY.md, CHANGELOG_INPUT_STATS.md, how_to_install.txt
+   - 추가: docs/REFACTORING.md (이번 리팩터링 내용)
+
+2. Loss 모듈 통합
+   - gs_merge/loss/gmae_loss.py에 모든 손실 함수 통합
+     - GMAELoss (메인 손실)
+     - ChamferLoss (Baseline)
+     - parse_gaussian_tensor() (유틸)
+     - model_output_to_dict() (유틸)
+   - 삭제: chamfer_loss.py, utils.py (중복 제거)
+
+3. Scripts 구조화
+   - 새 폴더: scripts/utils/
+   - 이동: voxel_info.py → scripts/utils/
+
+4. README 업데이트
+   - 최신 프로젝트 구조 반영
+   - 리팩터링 변경사항 명시
+
+=============================================================================
+호환성: 100% 유지 (기존 코드 수정 불필요)
+=============================================================================
+
+Import 예시 (변경 없음):
+  from gs_merge.loss import GMAELoss, ChamferLoss
+  from gs_merge import GaussianMergingAE
+  from gs_merge.training import Trainer
+
+테스트: ✅ 모든 import 정상 동작
+
+상세 내용: docs/REFACTORING.md 참조
+=============================================================================

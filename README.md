@@ -48,7 +48,6 @@ python scripts/compress.py \
 ```
 gaussian-autoencoder/
 ├── gs_merge/                   # Main package
-│   ├── __init__.py
 │   ├── model/                  # Neural network models
 │   │   ├── encoder.py          # Positional encodings
 │   │   ├── heads.py            # Gaussian output heads
@@ -58,18 +57,44 @@ gaussian-autoencoder/
 │   │   ├── ply_io.py           # PLY load/save
 │   │   ├── voxelizer.py        # Octree voxelization
 │   │   └── dataset.py          # PyTorch Dataset
-│   ├── loss/                   # Loss functions
-│   │   ├── gmae_loss.py        # GMAE Loss (Density + Render)
-│   │   └── chamfer_loss.py     # Chamfer distance loss
+│   ├── loss/                   # Loss functions (UNIFIED)
+│   │   ├── gmae_loss.py        # All losses + utilities
+│   │   └── __init__.py         # - GMAELoss, ChamferLoss
+│   ├── training/               # Training infrastructure
+│   │   ├── trainer.py          # Main trainer
+│   │   ├── callbacks.py        # TensorBoard, Checkpoint, Logging
+│   │   └── schedulers.py       # Learning rate, Gumbel schedulers
+│   ├── config/                 # Configuration
+│   │   ├── args.py             # CLI arguments
+│   │   └── loader.py           # YAML config loader
 │   └── utils/                  # Utilities
-│       └── voxel_utils.py      # Voxel ↔ Gaussian conversion
+│       ├── voxel_utils.py      # Voxel ↔ Gaussian conversion
+│       └── debug_utils.py      # Debug statistics
 ├── scripts/                    # CLI scripts
-│   ├── train.py
-│   └── compress.py
-├── configs/                    # Configuration files
+│   ├── train.py                # Training script
+│   ├── compress.py             # Compression script
+│   └── utils/                  # Utility scripts
+│       └── voxel_info.py       # Voxel inspection tool
+├── configs/                    # YAML configurations
+│   ├── default.yaml            # Default training config
+│   ├── custom.yaml             # Custom experiments
+│   └── chamfer.yaml            # Chamfer loss baseline
+├── docs/                       # Documentation
+│   ├── TENSORBOARD.md          # TensorBoard guide
+│   ├── MULTI_PLY.md            # Multi-file training
+│   ├── CHANGELOG_INPUT_STATS.md # Recent changes
+│   └── how_to_install.txt      # Installation guide
+├── tests/                      # Unit tests
 ├── checkpoints/                # Model checkpoints
 └── outputs/                    # Output files
 ```
+
+### Key Changes in Refactoring
+
+✅ **Documentation organized** → All docs moved to `docs/`  
+✅ **Loss module unified** → `gmae_loss.py` contains everything  
+✅ **Scripts organized** → Utilities in `scripts/utils/`  
+✅ **Cleaner structure** → Removed redundant files
 
 ## Architecture
 

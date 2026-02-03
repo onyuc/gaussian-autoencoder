@@ -13,30 +13,39 @@ from gs_merge.data.voxelizer import VoxelNode, OctreeVoxelizer
 
 class VoxelDataset(Dataset):
     """
-    Voxel 기반 Gaussian 배치 생성
+    Voxel 기반 Gaussian 배치 생성 (여러 PLY 파일 지원)
     
     Args:
-        gaussians: GaussianData 객체
-        voxels: VoxelNode 리스트
+        voxel_data: (VoxelNode, GaussianData) 튜플 리스트 또는
+                    기존 호환성을 위한 (gaussians, voxels) 형태
         max_per_voxel: Voxel 당 최대 Gaussian 수
         shuffle_voxels: 매 epoch 마다 voxel 순서 섞기
     """
     
     def __init__(
         self,
-        gaussians: GaussianData,
-        voxels: List[VoxelNode],
+        voxel_data,  # List[(VoxelNode, GaussianData)] or (GaussianData, List[VoxelNode])
         max_per_voxel: int = 128,
         shuffle_voxels: bool = True
     ):
-        self.gaussians = gaussians
-        self.voxels = voxels
+        # 호환성: 기존 방식 (gaussians, voxels) 지원
+        if isinstance(voxel_data, tuple) and len(voxel_data) == 2:
+            gaussians, voxels = voxel_data
+            self.voxel_data = [(voxel, gaussians) for voxel in voxels]
+        else:
+            # 새로운 방식: List[(voxel, gaussians)]
+            self.voxel_data = voxel_data
+        
         self.max_per_voxel = max_per_voxel
         self.shuffle_voxels = shuffle_voxels
-        self.device = gaussians.xyz.device
+        # device는 첫 번째 voxel의 gaussians에서 가져옴
+        if self.voxel_data:
+            self.device = self.voxel_data[0][1].xyz.device
+        else:
+            self.device = torch.device('cpu')
     
     def __len__(self) -> int:
-        return len(self.voxels)
+        return len(self.voxel_data)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, torch.Tensor]:
         """
@@ -45,10 +54,10 @@ class VoxelDataset(Dataset):
             level: Voxel의 octree level
             mask: [max_per_voxel] 유효하지 않은 위치 마스크 (True = padding)
         """
-        voxel = self.voxels[idx]
+        voxel, gaussians = self.voxel_data[idx]
         
         # Gaussian features 정규화
-        features = self._normalize_voxel(voxel)  # [N, 59]
+        features = self._normalize_voxel(voxel, gaussians)  # [N, 59]
         N = features.shape[0]
         
         # Padding
@@ -67,22 +76,22 @@ class VoxelDataset(Dataset):
         
         return features, voxel.level, mask
     
-    def _normalize_voxel(self, voxel: VoxelNode) -> torch.Tensor:
+    def _normalize_voxel(self, voxel: VoxelNode, gaussians: GaussianData) -> torch.Tensor:
         """Voxel 내 Gaussian을 정규화 [N, 59]"""
         import math
         idx = voxel.indices
         half_size = voxel.size / 2
         
-        local_xyz = (self.gaussians.xyz[idx] - voxel.center) / half_size
-        local_scale = self.gaussians.scale[idx] - math.log(half_size)
+        local_xyz = (gaussians.xyz[idx] - voxel.center) / half_size
+        local_scale = gaussians.scale[idx] - math.log(half_size)
         
         return torch.cat([
             local_xyz,                        # [N, 3]
-            self.gaussians.rotation[idx],     # [N, 4]
+            gaussians.rotation[idx],          # [N, 4]
             local_scale,                      # [N, 3]
-            self.gaussians.opacity[idx],      # [N, 1]
-            self.gaussians.sh_dc[idx],        # [N, 3]
-            self.gaussians.sh_rest[idx]       # [N, 45]
+            gaussians.opacity[idx],           # [N, 1]
+            gaussians.sh_dc[idx],             # [N, 3]
+            gaussians.sh_rest[idx]            # [N, 45]
         ], dim=-1)
     
     def collate_fn(self, batch: List[Tuple[torch.Tensor, int, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

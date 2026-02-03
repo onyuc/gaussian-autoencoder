@@ -5,6 +5,11 @@ GMAE Loss: Distribution-based Loss for Gaussian Reconstruction
 1. Density Field KL Divergence - 공간 분포 매칭
 2. Random View Rendering Loss - 시각적 일관성  
 3. Opacity Sparsity - 불필요한 Gaussian 억제
+
+Includes:
+- GMAELoss: 메인 손실 함수
+- ChamferLoss: Baseline 손실 함수
+- Utility functions: parse_gaussian_tensor, model_output_to_dict
 """
 
 import os
@@ -19,6 +24,59 @@ from gs_merge.utils.debug_utils import print_gaussian_stats
 from fused_ssim import fused_ssim
 
 
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def parse_gaussian_tensor(data: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """
+    [B, N, 59] 또는 [N, 59] 텐서를 Gaussian 속성 딕셔너리로 분해
+    
+    순서: xyz(3) + rot(4) + scale(3) + opacity(1) + sh_dc(3) + sh_rest(45)
+    """
+    if data.dim() == 2:
+        data = data.unsqueeze(0)
+    
+    return {
+        'xyz': data[..., :3],
+        'rotation': data[..., 3:7],
+        'scale': data[..., 7:10],
+        'opacity': data[..., 10:11],
+        'sh_dc': data[..., 11:14],
+        'sh_rest': data[..., 14:59]
+    }
+
+
+def model_output_to_dict(
+    xyz: torch.Tensor, 
+    rot: torch.Tensor, 
+    scale: torch.Tensor, 
+    opacity: torch.Tensor, 
+    sh: torch.Tensor
+) -> Dict[str, torch.Tensor]:
+    """
+    모델 출력을 Gaussian 딕셔너리로 변환
+    
+    Args:
+        xyz: [B, M, 3]
+        rot: [B, M, 4]
+        scale: [B, M, 3] (log space)
+        opacity: [B, M, 1] (logit space)
+        sh: [B, M, 48] (sh_dc + sh_rest)
+    
+    Returns:
+        딕셔너리 형태의 Gaussian 속성
+    """
+    return {
+        'xyz': xyz,
+        'rotation': rot,
+        'scale': scale,
+        'opacity': opacity,
+        'sh_dc': sh[..., :3],
+        'sh_rest': sh[..., 3:48]
+    }
+
+
 def _is_main_process() -> bool:
     """분산 학습 시 메인 프로세스인지 확인"""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -29,6 +87,109 @@ def _print_main(*args, **kwargs):
     """메인 프로세스에서만 출력"""
     if _is_main_process():
         print(*args, **kwargs)
+
+
+# =============================================================================
+# ChamferLoss (Baseline)
+# =============================================================================
+
+class ChamferLoss(nn.Module):
+    """
+    Chamfer Distance 기반 Baseline 손실
+    
+    위치 매칭 후 각 속성(rotation, scale, opacity, SH)에 대해 L1/L2 손실 적용
+    """
+    
+    def __init__(
+        self,
+        pos_weight: float = 1.0,
+        rot_weight: float = 0.5,
+        scale_weight: float = 0.5,
+        opacity_weight: float = 0.3,
+        sh_weight: float = 0.2
+    ):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.rot_weight = rot_weight
+        self.scale_weight = scale_weight
+        self.opacity_weight = opacity_weight
+        self.sh_weight = sh_weight
+    
+    def forward(
+        self,
+        input_g: Dict[str, torch.Tensor],
+        output_g: Dict[str, torch.Tensor],
+        input_mask: Optional[torch.Tensor] = None,
+        output_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Chamfer distance + 매칭 기반 속성 손실"""
+        B, N, _ = input_g['xyz'].shape
+        M = output_g['xyz'].shape[1]
+        device = input_g['xyz'].device
+        
+        # 거리 행렬
+        dist = torch.cdist(output_g['xyz'], input_g['xyz'], p=2)
+        if input_mask is not None:
+            dist = dist.masked_fill(input_mask.unsqueeze(1), float('inf'))
+        
+        # 매칭
+        min_out_to_in, match_idx = dist.min(dim=2)
+        min_in_to_out, _ = dist.min(dim=1)
+        
+        # Position Loss
+        if input_mask is not None:
+            valid = ~input_mask
+            pos_loss = min_out_to_in.mean() + (min_in_to_out * valid).sum() / valid.sum().clamp(min=1)
+        else:
+            pos_loss = min_out_to_in.mean() + min_in_to_out.mean()
+        pos_loss = pos_loss / 2
+        
+        # 매칭된 속성
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, M)
+        matched_rot = input_g['rotation'][batch_idx, match_idx]
+        matched_scale = input_g['scale'][batch_idx, match_idx]
+        matched_opacity = input_g['opacity'][batch_idx, match_idx]
+        
+        # Rotation Loss
+        rot_dot = (output_g['rotation'] * matched_rot).sum(dim=-1).abs()
+        rot_loss = (1 - rot_dot).mean()
+        
+        # Scale Loss
+        scale_loss = F.l1_loss(output_g['scale'], matched_scale)
+        
+        # Opacity Loss
+        opacity_loss = F.l1_loss(output_g['opacity'], matched_opacity)
+        
+        # SH Loss
+        if 'sh_dc' in input_g and 'sh_dc' in output_g:
+            matched_sh_dc = input_g['sh_dc'][batch_idx, match_idx]
+            matched_sh_rest = input_g['sh_rest'][batch_idx, match_idx]
+            sh_loss = F.l1_loss(output_g['sh_dc'], matched_sh_dc) + F.l1_loss(output_g['sh_rest'], matched_sh_rest)
+        else:
+            sh_loss = torch.tensor(0.0, device=device)
+        
+        # Total
+        total_loss = (
+            self.pos_weight * pos_loss +
+            self.rot_weight * rot_loss +
+            self.scale_weight * scale_loss +
+            self.opacity_weight * opacity_loss +
+            self.sh_weight * sh_loss
+        )
+        
+        return total_loss, {
+            'loss_pos': pos_loss.item(),
+            'loss_rot': rot_loss.item(),
+            'loss_scale': scale_loss.item(),
+            'loss_opacity': opacity_loss.item(),
+            'loss_sh': sh_loss.item() if isinstance(sh_loss, torch.Tensor) else sh_loss,
+            'loss_total': total_loss.item()
+        }
+
+
+# =============================================================================
+# GMAELoss (Main Loss)
+# =============================================================================
 
 class GMAELoss(nn.Module):
     """
@@ -47,8 +208,6 @@ class GMAELoss(nn.Module):
         lambda_sparsity: float = 0.05,
         n_density_samples: int = 1024,
         render_resolution: int = 64,
-        debug_save_dir: str = "./debug_renders",
-        debug_save_interval: int = 100,
         warmup_iterations: int = 200
     ):
         super().__init__()
@@ -57,13 +216,9 @@ class GMAELoss(nn.Module):
         self.lambda_sparsity = lambda_sparsity
         self.n_samples = n_density_samples
         self.render_resolution = render_resolution
-        self.debug_save_dir = debug_save_dir
-        self.debug_save_interval = debug_save_interval
         self.warmup_iterations = warmup_iterations
         
         self._debug_count = 0
-        self._render_call_count = 0
-        self._render_save_count = 0
         self._iteration = 0
 
     def forward(
@@ -71,7 +226,8 @@ class GMAELoss(nn.Module):
         input_g: Dict[str, torch.Tensor],
         output_g: Dict[str, torch.Tensor], 
         input_mask: Optional[torch.Tensor] = None,
-        output_mask: Optional[torch.Tensor] = None
+        output_mask: Optional[torch.Tensor] = None,
+        return_debug_info: bool = False
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Args:
@@ -88,7 +244,12 @@ class GMAELoss(nn.Module):
         loss_density = self.compute_density_loss(input_g, output_g, input_mask, output_mask)
         
         # 2. Rendering Loss
-        loss_render = self.compute_rendering_loss(input_g, output_g, input_mask, output_mask)
+        if return_debug_info:
+            loss_render, debug_info = self.compute_rendering_loss(
+                input_g, output_g, input_mask, output_mask, return_debug_info=True
+            )
+        else:
+            loss_render = self.compute_rendering_loss(input_g, output_g, input_mask, output_mask)
         
         # 3. Sparsity Loss
         loss_sparsity = self.compute_sparsity_loss(output_g, output_mask)
@@ -96,18 +257,9 @@ class GMAELoss(nn.Module):
         # Iteration counter
         self._iteration += 1
         
-        # Debug 출력
-        self._debug_count += 1
-        if self._debug_count % self.debug_save_interval == 0:
-            warmup_status = f"WARMUP {self._iteration}/{self.warmup_iterations}" if self._iteration < self.warmup_iterations else "NORMAL"
-            _print_main(f"[{warmup_status}] Training mode")
-            print_gaussian_stats(
-                input_g, output_g, 
-                loss_density, loss_render,
-                iteration=self._debug_count,
-                input_mask=input_mask,
-                output_mask=output_mask
-            )
+        # 가우시안 통계 수집 (입력 + 출력)
+        output_stats = self._compute_gaussian_stats(output_g, output_mask, prefix='output')
+        input_stats = self._compute_gaussian_stats(input_g, input_mask, prefix='input')
         
         # Total Loss
         total_loss = (
@@ -116,12 +268,24 @@ class GMAELoss(nn.Module):
             self.lambda_sparsity * loss_sparsity
         )
         
-        return total_loss, {
+        loss_dict = {
             "loss_density": loss_density.item(),
             "loss_render": loss_render.item(),
             "loss_sparsity": loss_sparsity.item(),
-            "loss_total": total_loss.item()
+            "loss_total": total_loss.item(),
+            **output_stats,  # 출력 가우시안 통계
+            **input_stats    # 입력 가우시안 통계
         }
+        
+        if return_debug_info:
+            # 히스토그램 데이터 추가 (입력 + 출력)
+            debug_info['histograms'] = {
+                **{f'output_{k}': v for k, v in self._get_histograms(output_g, output_mask).items()},
+                **{f'input_{k}': v for k, v in self._get_histograms(input_g, input_mask).items()}
+            }
+            return total_loss, loss_dict, debug_info
+        else:
+            return total_loss, loss_dict
 
     # =========================================================================
     # [1] Density Field Matching (KLD)
@@ -282,7 +446,8 @@ class GMAELoss(nn.Module):
         in_g: Dict[str, torch.Tensor],
         out_g: Dict[str, torch.Tensor],
         in_mask: Optional[torch.Tensor],
-        out_mask: Optional[torch.Tensor]
+        out_mask: Optional[torch.Tensor],
+        return_debug_info: bool = False
     ) -> torch.Tensor:
         """gsplat을 사용한 렌더링 Loss 계산"""
         B = in_g['xyz'].shape[0]
@@ -292,6 +457,7 @@ class GMAELoss(nn.Module):
         
         H, W = self.render_resolution, self.render_resolution
         fov_y = math.radians(60)
+        debug_renders = [] if return_debug_info else None
         
         for b in range(B):
             in_g_b = {k: v[b] for k, v in in_g.items()}
@@ -317,14 +483,16 @@ class GMAELoss(nn.Module):
             img_in, alpha_in = self._render_with_gsplat(in_g_b, in_mask_b, view_mat, K, H, W, backgrounds)
             img_out, alpha_out = self._render_with_gsplat(out_g_b, out_mask_b, view_mat, K, H, W, backgrounds)
             
-            # Debug 이미지 저장
-            if b == 0:
-                self._render_call_count += 1
-                if self._render_call_count % self.debug_save_interval == 0:
-                    n_in = (~in_mask_b).sum().item() if in_mask_b is not None else in_g_b['xyz'].shape[0]
-                    n_out = (~out_mask_b).sum().item() if out_mask_b is not None else out_g_b['xyz'].shape[0]
-                    self._save_render_pair(img_in, img_out, n_in, n_out)
-            
+            # 디버그 정보 저장 (첫 번째 배치만)
+            if return_debug_info and b == 0:
+                n_in = (~in_mask_b).sum().item() if in_mask_b is not None else in_g_b['xyz'].shape[0]
+                n_out = (~out_mask_b).sum().item() if out_mask_b is not None else out_g_b['xyz'].shape[0]
+                debug_renders.append({
+                    'img_in': img_in.detach().cpu(),
+                    'img_out': img_out.detach().cpu(),
+                    'n_in': n_in,
+                    'n_out': n_out
+                })
 
             if img_in.abs().sum() > 1e-6 or img_out.abs().sum() > 1e-6:
 
@@ -347,9 +515,16 @@ class GMAELoss(nn.Module):
                 valid_count += 1
         
         if valid_count == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            if return_debug_info:
+                return torch.tensor(0.0, device=device, requires_grad=True), {'renders': debug_renders}
+            else:
+                return torch.tensor(0.0, device=device, requires_grad=True)
             
-        return total_loss / valid_count
+        loss = total_loss / valid_count
+        if return_debug_info:
+            return loss, {'renders': debug_renders}
+        else:
+            return loss
     
     def _render_with_gsplat(
         self,
@@ -465,27 +640,7 @@ class GMAELoss(nn.Module):
         
         return view_mat, K
     
-    def _save_render_pair(self, img_in: torch.Tensor, img_out: torch.Tensor, n_in: int, n_out: int):
-        """디버그용: 렌더링 쌍 이미지 저장"""
-        from PIL import Image
-        import numpy as np
-        
-        os.makedirs(self.debug_save_dir, exist_ok=True)
-        
-        idx = self._render_save_count
-        self._render_save_count += 1
-        
-        img_in_np = (img_in.detach().cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
-        img_out_np = (img_out.detach().cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
-        combined = np.concatenate([img_in_np, img_out_np], axis=1)
-        
-        Image.fromarray(img_in_np).save(f"{self.debug_save_dir}/render_{idx:04d}_input.png")
-        Image.fromarray(img_out_np).save(f"{self.debug_save_dir}/render_{idx:04d}_output.png")
-        Image.fromarray(combined).save(f"{self.debug_save_dir}/render_{idx:04d}_combined.png")
-        
-        _print_main(f"[debug] Saved render #{idx} (input: {n_in} gs, output: {n_out} gs)")
-
-    # =========================================================================
+    # ==========================================================================
     # [3] Sparsity Loss
     # =========================================================================
     def compute_sparsity_loss(
@@ -524,24 +679,113 @@ class GMAELoss(nn.Module):
         # log_scale 공간에서 시그모이드 정규화 (각 가우시안별로 적용)
         normalized_scale = torch.sigmoid(log_scale)  # [num_valid], 각 가우시안의 정규화된 scale
                 
-        # 0.3 이상이면 1로 설정 (gradient 안 받음)
+        # 클램프된 값으로 페널티 계산
         MAX_OPACITY = 0.3
         valid_opacity_clamped = torch.clamp(valid_opacity, max=MAX_OPACITY)
 
-        # 0.03 이상이면 1로 설정 (gradient 안 받음)
         MAX_SCALE = 0.03
         normalized_scale_clamped = torch.clamp(normalized_scale, max=MAX_SCALE)
-        #clamp로 바꿔보는것도 테스트 하면 좋을듯
-
-        # Presence penalty: presence가 낮은 가우시안에 페널티
-        # presence_penalty = -1.0 * torch.log(presence + 1e-20).mean()
+        
         valid_penalty = -1.0 * (torch.log(valid_opacity_clamped + 1e-20) - torch.log(torch.tensor(MAX_OPACITY + 1e-20))) * 5
         scale_penalty = -1.0 * (torch.log(normalized_scale_clamped + 1e-20) - torch.log(torch.tensor(MAX_SCALE + 1e-20)))
+        std_penalty =  (1 - valid_opacity * normalized_scale).std() * 5
         linear_push_loss = (1.0 - valid_opacity) * 0.1 + (1.0 - normalized_scale) * 0.05
         presence_penalty = (valid_penalty + scale_penalty + linear_push_loss).mean()
         
-        # warmup = min(1.0, self._iteration / max(self.warmup_iterations, 1))
-        
-        utilization_loss = presence_penalty
+        utilization_loss = presence_penalty + std_penalty
         
         return utilization_loss
+    
+    # =========================================================================
+    # [4] Gaussian Statistics (for TensorBoard/Logging)
+    # =========================================================================
+    def _compute_gaussian_stats(
+        self,
+        out_g: Dict[str, torch.Tensor],
+        out_mask: Optional[torch.Tensor],
+        prefix: str = 'gaussian'
+    ) -> Dict[str, float]:
+        """가우시안 통계 계산 (opacity, scale 등)
+        
+        Args:
+            out_g: 가우시안 파라미터
+            out_mask: 패딩 마스크
+            prefix: 통계 키 접두어 ('input', 'output', 'gaussian' 등)
+        """
+        stats = {}
+        
+        # Opacity 통계
+        opacity_raw = out_g['opacity']  # [B, M, 1]
+        opacity = torch.sigmoid(opacity_raw)
+        
+        if out_mask is not None:
+            valid_opacity = opacity[~out_mask]
+        else:
+            valid_opacity = opacity.flatten()
+        
+        if len(valid_opacity) > 0:
+            stats[f'{prefix}_opacity_mean'] = valid_opacity.mean().item()
+            stats[f'{prefix}_opacity_std'] = valid_opacity.std().item()
+            stats[f'{prefix}_opacity_min'] = valid_opacity.min().item()
+            stats[f'{prefix}_opacity_max'] = valid_opacity.max().item()
+            # 높은 opacity 가우시안 비율 (>0.5)
+            stats[f'{prefix}_opacity_high_ratio'] = (valid_opacity > 0.5).float().mean().item()
+        
+        # Scale 통계 (x, y, z 각각)
+        scale_raw = out_g['scale']  # [B, M, 3]
+        scale = torch.exp(scale_raw).clamp(max=2.0)  # log scale -> real scale, 2 이상 클램프
+        
+        if out_mask is not None:
+            valid_scale = scale[~out_mask]  # [num_valid, 3]
+        else:
+            valid_scale = scale.view(-1, 3)  # [B*M, 3]
+        
+        if len(valid_scale) > 0:
+            # 전체 평균 scale
+            scale_mean = valid_scale.mean(dim=-1)
+            stats[f'{prefix}_scale_mean'] = scale_mean.mean().item()
+            stats[f'{prefix}_scale_std'] = scale_mean.std().item()
+            stats[f'{prefix}_scale_min'] = scale_mean.min().item()
+            stats[f'{prefix}_scale_max'] = scale_mean.max().item()
+            
+            # 축별 통계
+            for i, axis in enumerate(['x', 'y', 'z']):
+                axis_scale = valid_scale[:, i]
+                stats[f'{prefix}_scale_{axis}_mean'] = axis_scale.mean().item()
+                stats[f'{prefix}_scale_{axis}_max'] = axis_scale.max().item()
+                stats[f'{prefix}_scale_{axis}_min'] = axis_scale.min().item()
+        
+        # 유효 가우시안 개수 (mask 제외)
+        if out_mask is not None:
+            stats[f'{prefix}_count_valid'] = (~out_mask).sum().item() / out_mask.shape[0]  # 평균
+        else:
+            stats[f'{prefix}_count_valid'] = out_g['xyz'].shape[1]
+        
+        return stats
+    
+    def _get_histograms(
+        self,
+        out_g: Dict[str, torch.Tensor],
+        out_mask: Optional[torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """히스토그램용 텐서 반환 (TensorBoard)"""
+        histograms = {}
+        
+        # Opacity
+        opacity = torch.sigmoid(out_g['opacity'])
+        if out_mask is not None:
+            valid_opacity = opacity[~out_mask].detach().cpu()
+        else:
+            valid_opacity = opacity.flatten().detach().cpu()
+        histograms['opacity'] = valid_opacity
+        
+        # Scale (평균, 2 이상 클램프)
+        scale = torch.exp(out_g['scale']).clamp(max=2.0)
+        scale_mean = scale.mean(dim=-1)
+        if out_mask is not None:
+            valid_scale = scale_mean[~out_mask].detach().cpu()
+        else:
+            valid_scale = scale_mean.flatten().detach().cpu()
+        histograms['scale'] = valid_scale
+        
+        return histograms
