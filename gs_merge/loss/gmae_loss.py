@@ -16,7 +16,19 @@ from typing import Dict, Tuple, Optional
 
 from gsplat import rasterization
 from gs_merge.utils.debug_utils import print_gaussian_stats
+from fused_ssim import fused_ssim
 
+
+def _is_main_process() -> bool:
+    """분산 학습 시 메인 프로세스인지 확인"""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    return local_rank == 0
+
+
+def _print_main(*args, **kwargs):
+    """메인 프로세스에서만 출력"""
+    if _is_main_process():
+        print(*args, **kwargs)
 
 class GMAELoss(nn.Module):
     """
@@ -88,7 +100,7 @@ class GMAELoss(nn.Module):
         self._debug_count += 1
         if self._debug_count % self.debug_save_interval == 0:
             warmup_status = f"WARMUP {self._iteration}/{self.warmup_iterations}" if self._iteration < self.warmup_iterations else "NORMAL"
-            print(f"[{warmup_status}] Training mode")
+            _print_main(f"[{warmup_status}] Training mode")
             print_gaussian_stats(
                 input_g, output_g, 
                 loss_density, loss_render,
@@ -328,7 +340,10 @@ class GMAELoss(nn.Module):
                 
                 loss_alpha_l1 = F.l1_loss(alpha_out.squeeze(), alpha_in.squeeze())
 
-                total_loss += loss_rendered + loss_alpha_l1
+                # RGB에만 SSIM 적용 
+                loss_ssim_rendered = 1.0 - fused_ssim(img_out.permute(2,0,1).unsqueeze(0), img_in.permute(2,0,1).unsqueeze(0), padding='valid')
+
+                total_loss += loss_rendered + loss_alpha_l1 + 0.3 * loss_ssim_rendered
                 valid_count += 1
         
         if valid_count == 0:
@@ -407,7 +422,7 @@ class GMAELoss(nn.Module):
             render_colors = render_colors.squeeze(0).clamp(0.0, 1.0)
             return render_colors, render_alphas
         except Exception as e:
-            print(f"[gsplat error] {e}")
+            _print_main(f"[gsplat error] {e}")
             return torch.zeros((H, W, 3), device=device, requires_grad=True), torch.zeros((H, W), device=device, requires_grad=True)
     
     def _get_random_camera(
@@ -468,7 +483,7 @@ class GMAELoss(nn.Module):
         Image.fromarray(img_out_np).save(f"{self.debug_save_dir}/render_{idx:04d}_output.png")
         Image.fromarray(combined).save(f"{self.debug_save_dir}/render_{idx:04d}_combined.png")
         
-        print(f"[debug] Saved render #{idx} (input: {n_in} gs, output: {n_out} gs)")
+        _print_main(f"[debug] Saved render #{idx} (input: {n_in} gs, output: {n_out} gs)")
 
     # =========================================================================
     # [3] Sparsity Loss
@@ -510,19 +525,23 @@ class GMAELoss(nn.Module):
         normalized_scale = torch.sigmoid(log_scale)  # [num_valid], 각 가우시안의 정규화된 scale
                 
         # 0.3 이상이면 1로 설정 (gradient 안 받음)
-        valid_opacity_clamped = torch.clamp(valid_opacity, max=0.3)
+        MAX_OPACITY = 0.3
+        valid_opacity_clamped = torch.clamp(valid_opacity, max=MAX_OPACITY)
 
         # 0.03 이상이면 1로 설정 (gradient 안 받음)
-        normalized_scale_clamped = torch.clamp(normalized_scale, max=0.03)
+        MAX_SCALE = 0.03
+        normalized_scale_clamped = torch.clamp(normalized_scale, max=MAX_SCALE)
         #clamp로 바꿔보는것도 테스트 하면 좋을듯
 
         # Presence penalty: presence가 낮은 가우시안에 페널티
         # presence_penalty = -1.0 * torch.log(presence + 1e-20).mean()
-        presence_penalty = -1.0 * (torch.log(valid_opacity_clamped + 1e-20) * 5 + torch.log(normalized_scale_clamped + 1e-20)).mean()
-        presence_penalty_bias = (1 - valid_opacity).mean() * 0.1
+        valid_penalty = -1.0 * (torch.log(valid_opacity_clamped + 1e-20) - torch.log(torch.tensor(MAX_OPACITY + 1e-20))) * 5
+        scale_penalty = -1.0 * (torch.log(normalized_scale_clamped + 1e-20) - torch.log(torch.tensor(MAX_SCALE + 1e-20)))
+        linear_push_loss = (1.0 - valid_opacity) * 0.1 + (1.0 - normalized_scale) * 0.05
+        presence_penalty = (valid_penalty + scale_penalty + linear_push_loss).mean()
         
         # warmup = min(1.0, self._iteration / max(self.warmup_iterations, 1))
         
-        utilization_loss = presence_penalty + presence_penalty_bias
+        utilization_loss = presence_penalty
         
         return utilization_loss

@@ -241,6 +241,33 @@ def get_training_parser() -> argparse.ArgumentParser:
         choices=["cuda", "cpu"],
         help="Device to use for training"
     )
+    sys_group.add_argument(
+        "--use_accelerate",
+        action="store_true",
+        help="Use Accelerate for Multi-GPU distributed training"
+    )
+    sys_group.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Number of DataLoader workers per GPU"
+    )
+    sys_group.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="Use pinned memory for DataLoader"
+    )
+    sys_group.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps (effective_batch = batch_size * num_gpus * grad_accum)"
+    )
+    sys_group.add_argument(
+        "--find_unused_parameters",
+        action="store_true",
+        help="Enable find_unused_parameters in DDP (slower but needed for some models)"
+    )
     
     return parser
 
@@ -259,7 +286,12 @@ def parse_args_with_config(
     Returns:
         Parsed and merged arguments
     """
+    import os
     from .loader import load_config, merge_config_with_args, get_default_config_path
+    
+    # 분산 학습 시 메인 프로세스에서만 출력
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_main_process = local_rank == 0
     
     if parser is None:
         parser = get_training_parser()
@@ -268,17 +300,20 @@ def parse_args_with_config(
     
     # Load config if provided, otherwise use default
     if args.config:
-        print(f"Loading config from: {args.config}")
+        if is_main_process:
+            print(f"Loading config from: {args.config}")
         config = load_config(args.config)
         args = merge_config_with_args(config, args)
     else:
         default_config_path = get_default_config_path()
         if default_config_path.exists():
-            print(f"Loading default config from: {default_config_path}")
+            if is_main_process:
+                print(f"Loading default config from: {default_config_path}")
             config = load_config(str(default_config_path))
             args = merge_config_with_args(config, args)
         else:
-            print("⚠ No config file found, using command-line arguments only")
+            if is_main_process:
+                print("⚠ No config file found, using command-line arguments only")
             # Set fallback defaults
             _set_fallback_defaults(args)
     

@@ -4,26 +4,36 @@
 data:
   voxel_size: 100.0
   max_level: 16
-  min_gaussians: 8
-  max_gaussians: 128
+  min_gaussians: 128
+  max_gaussians: 1024
   val_split: 0.1
+  num_workers: 4  # DataLoader workers per GPU
+  pin_memory: true
 
 # Model
 model:
   input_dim: 59
   latent_dim: 256
-  num_queries: 128
+  num_queries: 1024
   nhead: 8
   num_enc_layers: 4
   num_dec_layers: 4
 
 # Training
 training:
-  batch_size: 32
+  batch_size: 32  # per-GPU batch size
   epochs: 5000
-  lr: 0.0001
+  lr: 0.0001  # base learning rate (auto-scaled with num_gpus)
   weight_decay: 0.00001
   grad_clip: 1.0
+  
+# Distributed Training (Multi-GPU)
+distributed:
+  enabled: true
+  backend: "nccl"  # nccl (NVIDIA), gloo (CPU fallback)
+  find_unused_parameters: false
+  gradient_accumulation_steps: 1
+  sync_bn: false  # Synchronized BatchNorm (if using BatchNorm)
 
 # Loss
 loss:
@@ -38,6 +48,6 @@ loss:
 
 # Output
 output:
-  save_dir: "./checkpoints/rand_background_hinge"
+  save_dir: "/scratch/rchkl2380/Workspace/gaussian-autoencoder/checkpoints/ssim_1024"
   save_interval: 100
   debug_save_interval: 100

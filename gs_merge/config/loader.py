@@ -43,6 +43,8 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     merged.min_gaussians = config['data'].get('min_gaussians', 8)
     merged.max_gaussians = config['data']['max_gaussians']
     merged.val_split = config['data']['val_split']
+    merged.num_workers = config['data'].get('num_workers', 0)
+    merged.pin_memory = config['data'].get('pin_memory', False)
     
     # Model config
     merged.input_dim = config['model']['input_dim']
@@ -58,6 +60,14 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     merged.lr = config['training']['lr']
     merged.weight_decay = config['training']['weight_decay']
     merged.grad_clip = config['training']['grad_clip']
+    
+    # Distributed config (Multi-GPU)
+    if 'distributed' in config:
+        merged.gradient_accumulation_steps = config['distributed'].get('gradient_accumulation_steps', 1)
+        merged.find_unused_parameters = config['distributed'].get('find_unused_parameters', False)
+    else:
+        merged.gradient_accumulation_steps = 1
+        merged.find_unused_parameters = False
     
     # Loss config
     merged.loss_type = config['loss']['type']
@@ -85,6 +95,7 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     merged.device = getattr(args, 'device', 'cuda')
     merged.resume = getattr(args, 'resume', None)
     merged.config = getattr(args, 'config', None)
+    merged.use_accelerate = getattr(args, 'use_accelerate', False)
     
     return merged
 

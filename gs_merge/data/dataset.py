@@ -94,14 +94,31 @@ class VoxelDataset(Dataset):
             torch.stack(masks)                                        # [B, max_per_voxel]
         )
     
-    def get_dataloader(self, batch_size: int, shuffle: bool = True, num_workers: int = 0) -> DataLoader:
-        """DataLoader 생성"""
+    def get_dataloader(
+        self, 
+        batch_size: int, 
+        shuffle: bool = True, 
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        drop_last: bool = False,
+    ) -> DataLoader:
+        """DataLoader 생성
+        
+        Args:
+            batch_size: 배치 크기
+            shuffle: 데이터 셔플 여부
+            num_workers: DataLoader 워커 수
+            pin_memory: 메모리 핀 사용 여부 (GPU 전송 가속)
+            drop_last: 마지막 불완전한 배치 드롭 여부
+        """
         return DataLoader(
             self,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            collate_fn=self.collate_fn
+            collate_fn=self.collate_fn,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
         )
 
 

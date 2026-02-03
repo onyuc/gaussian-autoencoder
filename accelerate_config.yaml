@@ -1,0 +1,33 @@
+# Accelerate Configuration for Multi-GPU Training
+# Run: accelerate launch --config_file accelerate_config.yaml scripts/train.py
+# 또는: accelerate launch --multi_gpu --num_processes=2 scripts/train.py
+
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU  # MULTI_GPU, NO (single GPU), or FSDP
+num_processes: 2  # GPU 개수 (2-4개 권장)
+
+# Mixed Precision Training (속도 향상)
+mixed_precision: fp16  # fp16 (권장), bf16 (RTX 40xx), or no
+
+# Gradient Accumulation (배치 크기 가상 확장)
+# effective_batch = batch_size * num_processes * gradient_accumulation_steps
+gradient_accumulation_steps: 1
+
+# DDP 최적화 설정
+dynamo_backend: 'NO'  # 'NO' 또는 'inductor' (PyTorch 2.0+)
+downcast_bf16: 'no'
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+
+# DeepSpeed 사용 시 (optional, 큰 모델용)
+# deepspeed_config:
+#   zero_stage: 2
+#   offload_optimizer_device: none
+#   offload_param_device: none

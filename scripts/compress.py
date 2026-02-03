@@ -70,6 +70,7 @@ def compress_ply(
     model = GaussianMergingAE(
         input_dim=59,
         latent_dim=256,
+        num_inputs = 128,
         num_queries=num_queries,
         nhead=8,
         num_enc_layers=4,
@@ -79,9 +80,15 @@ def compress_ply(
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
     else:
-        model.load_state_dict(checkpoint)
+        state_dict = checkpoint
+    
+    # Remove 'module.' prefix if present (from DataParallel/DistributedDataParallel)
+    if any(key.startswith('module.') for key in state_dict.keys()):
+        state_dict = {key.replace('module.', ''): value for key, value in state_dict.items()}
+    
+    model.load_state_dict(state_dict)
     model.eval()
     print("  Model loaded successfully")
     

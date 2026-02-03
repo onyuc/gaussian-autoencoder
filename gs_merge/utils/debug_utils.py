@@ -4,8 +4,15 @@ Debug Utilities for GMAE Training
 디버그 통계 출력 및 시각화 유틸리티
 """
 
+import os
 import torch
 from typing import Dict, Optional
+
+
+def _is_main_process() -> bool:
+    """분산 학습 시 메인 프로세스인지 확인"""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    return local_rank == 0
 
 
 def print_gaussian_stats(
@@ -64,6 +71,10 @@ def print_gaussian_stats(
         out_xyz_filtered = out_xyz[out_valid_mask]
         out_scale_filtered = out_scale_real[out_valid_mask]
         out_opacity_filtered = out_opacity_real.squeeze(-1)[out_valid_mask]
+        
+        # 메인 프로세스에서만 출력
+        if not _is_main_process():
+            return
         
         print(f"\n{'='*60}")
         print(f"[DEBUG iter={iteration}] Input vs Output 분포 (opacity > 0.005)")

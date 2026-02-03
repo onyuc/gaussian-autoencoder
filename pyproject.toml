@@ -20,6 +20,7 @@ dependencies = [
     "plyfile>=0.8.0",
     "tqdm>=4.64.0",
     "pillow>=9.0.0",
+    "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -27,11 +28,19 @@ train = [
     "gsplat>=1.0.0",
     "fused-ssim",
 ]
+distributed = [
+    "accelerate>=0.25.0",  # Multi-GPU training
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "black>=23.0.0",
     "isort>=5.12.0",
+]
+all = [
+    "gsplat>=1.0.0",
+    "fused-ssim",
+    "accelerate>=0.25.0",
 ]
 
 [project.scripts]

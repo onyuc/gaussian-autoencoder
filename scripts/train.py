@@ -3,10 +3,17 @@
 Gaussian Merging AE Training Script
 
 Voxel 단위로 Gaussian을 압축하는 모델 학습
+Multi-GPU 학습 지원 (Accelerate 라이브러리)
 
 Usage:
+    # Single GPU
     python train.py --ply path/to/point_cloud.ply --epochs 100
-    python train.py --config configs/default.yaml --ply model.ply
+    
+    # Multi-GPU with Accelerate
+    accelerate launch --multi_gpu --num_processes=2 train.py --ply model.ply --use_accelerate
+    
+    # Multi-GPU with config file
+    accelerate launch --config_file accelerate_config.yaml train.py --config configs/default.yaml --ply model.ply
 """
 
 import os
@@ -14,6 +21,15 @@ import sys
 import random
 
 import torch
+
+# Accelerate for Multi-GPU
+try:
+    from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+    Accelerator = None
 
 # 패키지 import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -66,15 +82,20 @@ def setup_criterion(args, save_dir: str):
         return ChamferLoss()
 
 
-def setup_data(args, device: str):
+def setup_data(args, device: str, accelerator=None):
     """데이터 로더 생성"""
+    is_main = accelerator is None or accelerator.is_main_process
+    
     # Load PLY
-    print(f"\nLoading PLY: {args.ply}")
+    if is_main:
+        print(f"\nLoading PLY: {args.ply}")
     gaussians = load_ply(args.ply, device=device)
-    print(f"  Loaded {gaussians.num_gaussians:,} gaussians")
+    if is_main:
+        print(f"  Loaded {gaussians.num_gaussians:,} gaussians")
     
     # Voxelize
-    print(f"\nVoxelizing...")
+    if is_main:
+        print(f"\nVoxelizing...")
     voxelizer = OctreeVoxelizer(
         voxel_size=args.voxel_size,
         max_level=args.max_level,
@@ -85,7 +106,8 @@ def setup_data(args, device: str):
         cache_dir=args.cache_dir
     )
     voxels = voxelizer.voxelize_or_load(gaussians, args.ply, force_rebuild=args.force_rebuild)
-    print(f"  Created {len(voxels)} voxels")
+    if is_main:
+        print(f"  Created {len(voxels)} voxels")
     
     # Train/Val split
     random.shuffle(voxels)
@@ -93,22 +115,40 @@ def setup_data(args, device: str):
     train_voxels = voxels[n_val:]
     val_voxels = voxels[:n_val]
     
-    print(f"\nDataset split:")
-    print(f"  Train: {len(train_voxels)} voxels")
-    print(f"  Val: {len(val_voxels)} voxels")
+    if is_main:
+        print(f"\nDataset split:")
+        print(f"  Train: {len(train_voxels)} voxels")
+        print(f"  Val: {len(val_voxels)} voxels")
     
     # Create datasets
     train_dataset = VoxelDataset(gaussians, train_voxels, args.max_gaussians)
     val_dataset = VoxelDataset(gaussians, val_voxels, args.max_gaussians)
     
-    train_loader = train_dataset.get_dataloader(batch_size=args.batch_size, shuffle=True)
-    val_loader = val_dataset.get_dataloader(batch_size=args.batch_size, shuffle=False)
+    # DataLoader 설정
+    num_workers = getattr(args, 'num_workers', 0)
+    pin_memory = getattr(args, 'pin_memory', False)
+    
+    # Multi-GPU 학습 시 DistributedSampler 사용
+    train_loader = train_dataset.get_dataloader(
+        batch_size=args.batch_size, 
+        shuffle=True,
+        num_workers=num_workers,
+    )
+    val_loader = val_dataset.get_dataloader(
+        batch_size=args.batch_size, 
+        shuffle=False,
+        num_workers=num_workers,
+    )
     
     return train_loader, val_loader
 
 
-def setup_callbacks(args) -> list:
+def setup_callbacks(args, is_main_process: bool = True) -> list:
     """콜백 설정"""
+    # 메인 프로세스에서만 체크포인트 저장
+    if not is_main_process:
+        return []
+    
     callbacks = [
         CheckpointCallback(
             save_dir=args.save_dir,
@@ -142,16 +182,42 @@ def main():
     # Parse arguments with config
     args = parse_args_with_config()
     
-    device = args.device if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    # Accelerate 초기화
+    use_accelerate = getattr(args, 'use_accelerate', False) and ACCELERATE_AVAILABLE
+    accelerator = None
+    
+    if use_accelerate:
+        # DDP 설정
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=getattr(args, 'find_unused_parameters', False)
+        )
+        accelerator = Accelerator(
+            gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
+            kwargs_handlers=[ddp_kwargs],
+        )
+        device = accelerator.device
+        is_main = accelerator.is_main_process
+        
+        if is_main:
+            print(f"\n{'='*60}")
+            print(f"Multi-GPU Training with Accelerate")
+            print(f"  Number of GPUs: {accelerator.num_processes}")
+            print(f"  Mixed Precision: {accelerator.mixed_precision}")
+            print(f"  Device: {device}")
+            print(f"{'='*60}")
+    else:
+        device = args.device if torch.cuda.is_available() else "cpu"
+        is_main = True
+        print(f"Using device: {device}")
     
     # Setup
-    train_loader, val_loader = setup_data(args, device)
+    train_loader, val_loader = setup_data(args, device, accelerator)
     model = setup_model(args, device)
     criterion = setup_criterion(args, args.save_dir)
-    callbacks = setup_callbacks(args)
+    callbacks = setup_callbacks(args, is_main)
     
-    print(f"\nModel parameters: {model.num_parameters:,}")
+    if is_main:
+        print(f"\nModel parameters: {model.num_parameters:,}")
     
     # Gumbel Scheduler
     gumbel_scheduler = GumbelNoiseScheduler(
@@ -163,7 +229,7 @@ def main():
         schedule_type=getattr(args, 'gumbel_schedule_type', 'warmup_cosine')
     )
     
-    # Create Trainer
+    # Create Trainer with Accelerate support
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -176,19 +242,25 @@ def main():
         lr=args.lr,
         weight_decay=getattr(args, 'weight_decay', 1e-5),
         grad_clip=getattr(args, 'grad_clip', 1.0),
+        # Multi-GPU support
+        accelerator=accelerator,
+        use_accelerate=use_accelerate,
     )
     
     # Set compression ratio range (배치마다 랜덤 샘플링)
     trainer.compression_ratio_min = getattr(args, 'compression_ratio_min', 0.5)
     trainer.compression_ratio_max = getattr(args, 'compression_ratio_max', 0.5)
-    print(f"\nCompression ratio range: [{trainer.compression_ratio_min}, {trainer.compression_ratio_max}]")
+    if is_main:
+        print(f"\nCompression ratio range: [{trainer.compression_ratio_min}, {trainer.compression_ratio_max}]")
     
     # Resume if specified
     start_epoch = 1
     if args.resume:
-        print(f"\nResuming from {args.resume}")
+        if is_main:
+            print(f"\nResuming from {args.resume}")
         start_epoch = trainer.load_checkpoint(args.resume) + 1
-        print(f"  Resumed at epoch {start_epoch}")
+        if is_main:
+            print(f"  Resumed at epoch {start_epoch}")
     
     # Train
     trainer.train(start_epoch=start_epoch)
