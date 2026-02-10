@@ -260,7 +260,7 @@ class GMAELoss(nn.Module):
         # 가우시안 통계 수집 (입력 + 출력)
         output_stats = self._compute_gaussian_stats(output_g, output_mask, prefix='output')
         input_stats = self._compute_gaussian_stats(input_g, input_mask, prefix='input')
-        
+
         # Total Loss
         total_loss = (
             self.lambda_density * loss_density +
@@ -339,7 +339,7 @@ class GMAELoss(nn.Module):
         kld = torch.sum(p_in_safe * torch.log(p_in_safe / p_out_safe), dim=1)
         
         kld = torch.where(torch.isfinite(kld), kld, torch.zeros_like(kld))
-        
+
         return kld.mean()
 
     def _batch_gather(self, params: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -449,196 +449,273 @@ class GMAELoss(nn.Module):
         out_mask: Optional[torch.Tensor],
         return_debug_info: bool = False
     ) -> torch.Tensor:
-        """gsplat을 사용한 렌더링 Loss 계산"""
+        """gsplat을 사용한 렌더링 Loss 계산 (배치 병렬화)"""
         B = in_g['xyz'].shape[0]
         device = in_g['xyz'].device
-        total_loss = 0.0
-        valid_count = 0
-        
+        n_cameras = 8  # 카메라 개수
+
         H, W = self.render_resolution, self.render_resolution
-        fov_y = math.radians(60)
+        # fov_y = math.radians(60)
         debug_renders = [] if return_debug_info else None
+
+        # 1. 카메라 & K 행렬 한 번에 생성 (배치별 랜덤 FOV 포함)
+        view_mats, Ks = self._get_random_cameras(B, device, H, W, fov_min=40, fov_max=80, radius=5.0, n_cameras=n_cameras)
+        # [B, C, 4, 4], [B, C, 3, 3]
+
+        # 2. 랜덤 배경 생성 [B, C, 3]
+        backgrounds = self._get_random_backgrounds(device, batch_size=B, n_cameras=n_cameras, rgb_prob=0.5)  # [B, C, 3]
+
+        # ========== 배치 렌더링 (모든 가우시안 concatenate) ==========
+        with torch.no_grad():
+            img_in, alpha_in = self._render_with_gsplat(
+                in_g, in_mask, view_mats, Ks, H, W, backgrounds
+            )  # [B, C, H, W, 3], [B, C, H, W]
         
-        for b in range(B):
-            in_g_b = {k: v[b] for k, v in in_g.items()}
-            out_g_b = {k: v[b] for k, v in out_g.items()}
-            
-            in_mask_b = in_mask[b] if in_mask is not None else None
-            out_mask_b = out_mask[b] if out_mask is not None else None
-            
-            if in_mask_b is not None and (~in_mask_b).sum() == 0:
-                continue
-            
-            view_mat, K = self._get_random_camera(device, H, W, fov_y, radius=5.0)
-            
-            # ========== 랜덤 배경 생성 ==========
-            # 1. 완전 랜덤 (RGB 각 채널 독립)
-            if torch.rand(1).item() < 0.5:
-                backgrounds = torch.rand(3, device=device)  # [3]
-            else:
-                # 2. 흑백 랜덤 (그레이스케일)
-                gray = torch.rand(1, device=device).item()
-                backgrounds = torch.tensor([gray, gray, gray], device=device)  # [3]
-
-            img_in, alpha_in = self._render_with_gsplat(in_g_b, in_mask_b, view_mat, K, H, W, backgrounds)
-            img_out, alpha_out = self._render_with_gsplat(out_g_b, out_mask_b, view_mat, K, H, W, backgrounds)
-            
-            # 디버그 정보 저장 (첫 번째 배치만)
-            if return_debug_info and b == 0:
-                n_in = (~in_mask_b).sum().item() if in_mask_b is not None else in_g_b['xyz'].shape[0]
-                n_out = (~out_mask_b).sum().item() if out_mask_b is not None else out_g_b['xyz'].shape[0]
-                debug_renders.append({
-                    'img_in': img_in.detach().cpu(),
-                    'img_out': img_out.detach().cpu(),
-                    'n_in': n_in,
-                    'n_out': n_out
-                })
-
-            if img_in.abs().sum() > 1e-6 or img_out.abs().sum() > 1e-6:
-
-                # Alpha 값 자체를 가중치로 사용 (연속값)
-                # alpha_in: [1, H, W]
-                alpha_mask = (alpha_in > 0.001).squeeze(0)  # [H, W] = 0~1 연속값
-                n_rendered = alpha_mask.sum() + 1e-6
-                
-                diff = (img_out - img_in).abs()
-                loss_rendered_masked_l1 = (diff * alpha_mask).sum() / (n_rendered * 3)
-                loss_rendered_l1 = F.l1_loss(img_out, img_in)
-                loss_rendered = 1.0 * loss_rendered_masked_l1 + 0.3 * loss_rendered_l1
-                
-                loss_alpha_l1 = F.l1_loss(alpha_out.squeeze(), alpha_in.squeeze())
-
-                # RGB에만 SSIM 적용 
-                loss_ssim_rendered = 1.0 - fused_ssim(img_out.permute(2,0,1).unsqueeze(0), img_in.permute(2,0,1).unsqueeze(0), padding='valid')
-
-                total_loss += loss_rendered + loss_alpha_l1 + 0.3 * loss_ssim_rendered
-                valid_count += 1
+        img_out, alpha_out = self._render_with_gsplat(
+            out_g, out_mask, view_mats, Ks, H, W, backgrounds
+        )  # [B, C, H, W, 3], [B, C, H, W]
         
-        if valid_count == 0:
+        # 디버그 정보 (첫 배치만)
+        if return_debug_info:
+            in_mask_0 = in_mask[0] if in_mask is not None else None
+            out_mask_0 = out_mask[0] if out_mask is not None else None
+            n_in = (~in_mask_0).sum().item() if in_mask_0 is not None else in_g['xyz'].shape[1]
+            n_out = (~out_mask_0).sum().item() if out_mask_0 is not None else out_g['xyz'].shape[1]
+            debug_renders.append({
+                'img_in': img_in[0, 0].detach().cpu(),
+                'img_out': img_out[0, 0].detach().cpu(),
+                'n_in': n_in,
+                'n_out': n_out
+            })
+
+        # ========== Loss 계산 (배치 + 카메라 단위) ==========
+        # 유효한 렌더링 체크 [B, C]
+        valid_render = (alpha_in.abs().sum(dim=[2,3]) > 1e-6) | (alpha_out.abs().sum(dim=[2,3]) > 1e-6)  # [B, C]
+
+        if valid_render.sum() == 0:
             if return_debug_info:
                 return torch.tensor(0.0, device=device, requires_grad=True), {'renders': debug_renders}
             else:
                 return torch.tensor(0.0, device=device, requires_grad=True)
-            
-        loss = total_loss / valid_count
+        
+        # ========== Loss 계산 (배치 + 카메라 단위) ==========
+        # 유효한 (B, C) 인덱스만 선택
+        valid_indices = torch.where(valid_render)  # (batch_indices, camera_indices)
+        img_in_valid = img_in[valid_indices]      # [num_valid, H, W, 3]
+        img_out_valid = img_out[valid_indices]    # [num_valid, H, W, 3]
+        alpha_in_valid = alpha_in[valid_indices]  # [num_valid, H, W]
+        alpha_out_valid = alpha_out[valid_indices]  # [num_valid, H, W]
+
+        # Alpha 마스크 (유효한 것만) [num_valid, H, W]
+        alpha_mask = (alpha_in_valid > 0.001)
+        n_rendered = alpha_mask.sum(dim=[1,2]) + 1e-6  # [num_valid]
+
+        # L1 Loss (masked + unmasked) [num_valid]
+        diff = (img_out_valid - img_in_valid).abs()  # [num_valid, H, W, 3]
+
+        loss_masked_l1 = (diff * alpha_mask.unsqueeze(-1)).sum(dim=[1,2,3]) / (n_rendered * 3)  # [num_valid]
+        loss_l1 = F.l1_loss(img_out_valid, img_in_valid, reduction='none').mean(dim=[1,2,3])  # [num_valid]
+        loss_rendered = 1.0 * loss_masked_l1 + 0.3 * loss_l1  # [num_valid]
+
+        # Alpha Loss [num_valid]
+        loss_alpha = F.l1_loss(alpha_out_valid, alpha_in_valid, reduction='none').mean(dim=[1,2])  # [num_valid]
+
+        # SSIM Loss (유효한 것만) - 스칼라로 계산
+        img_in_flat = img_in_valid.permute(0, 3, 1, 2)  # [num_valid, 3, H, W]
+        img_out_flat = img_out_valid.permute(0, 3, 1, 2)  # [num_valid, 3, H, W]
+        ssim_scalar = fused_ssim(img_out_flat, img_in_flat, padding='valid')  # 스칼라
+        loss_ssim = 1.0 - ssim_scalar  # 스칼라
+
+        # 최종 Loss (유효한 것들만 평균)
+        loss = loss_rendered.mean() + loss_alpha.mean() + 0.3 * loss_ssim
+        
         if return_debug_info:
             return loss, {'renders': debug_renders}
         else:
             return loss
+        # # Alpha 마스크 (배치 + 카메라 단위) [B, C, H, W]
+        # alpha_mask = (alpha_in > 0.001)  # [B, C, H, W]
+        # n_rendered = alpha_mask.sum(dim=[2,3]) + 1e-6  # [B, C]
+
+        # # L1 Loss (masked + unmasked) [B, C]
+        # diff = (img_out - img_in).abs()  # [B, C, H, W, 3]
+        
+        # loss_masked_l1 = (diff * alpha_mask.unsqueeze(-1)).sum(dim=[2,3,4]) / (n_rendered * 3)  # [B, C]
+        # loss_l1 = F.l1_loss(img_out, img_in, reduction='none').mean(dim=[2,3,4])  # [B, C]
+        # loss_rendered = 1.0 * loss_masked_l1 + 0.3 * loss_l1  # [B, C]
+
+        # # Alpha Loss [B, C]
+        # loss_alpha = F.l1_loss(alpha_out, alpha_in, reduction='none').mean(dim=[2,3])  # [B, C]
+
+        # # SSIM Loss (배치 + 카메라 단위) [B, C]
+        # # img_in: [B, C, H, W, 3] -> [B*C, 3, H, W]
+        # img_in_flat = img_in.reshape(-1, H, W, 3).permute(0, 3, 1, 2)  # [B*C, 3, H, W]
+        # img_out_flat = img_out.reshape(-1, H, W, 3).permute(0, 3, 1, 2)  # [B*C, 3, H, W]
+        # ssim = fused_ssim(img_out_flat, img_in_flat, padding='valid')  # [B*C]
+        # loss_ssim = 1.0 - ssim
+
+        # # Total (유효한 배치+카메라만 평균)
+        # loss_rendered_mean = (loss_rendered * valid_render.float()).sum() / valid_render.sum()
+        # loss_alpha_mean = (loss_alpha * valid_render.float()).sum() / valid_render.sum()
+
+        # # 배치 전체 평균 (스칼라)
+        # loss = loss_rendered_mean + loss_alpha_mean + 0.3 * loss_ssim
+
+        # if return_debug_info:
+        #     return loss, {'renders': debug_renders}
+        # else:
+        #     return loss
+        
+            
+    def _get_random_backgrounds(
+        self, 
+        device: torch.device,
+        batch_size: int = 1,
+        n_cameras: int = 1,
+        rgb_prob: float = 0.5
+    ) -> torch.Tensor:
+        """
+        배치별, 카메라별 랜덤 배경색 생성 (RGB 또는 Gray)
+        
+        Args:
+            device: 텐서 디바이스
+            batch_size: 배치 크기
+            n_cameras: 카메라 개수
+            rgb_prob: RGB 배경 확률 (0.5면 50% RGB, 50% Gray)
+        
+        Returns:
+            [B, C, 3] tensor
+        """
+        backgrounds = []
+        
+        for _ in range(batch_size):
+            batch_backgrounds = []
+            for _ in range(n_cameras):
+                # RGB 또는 Gray 랜덤 선택
+                if torch.rand(1).item() < rgb_prob:
+                    # RGB 랜덤
+                    bg = torch.rand(3, device=device)
+                else:
+                    # 그레이스케일 랜덤
+                    gray_value = torch.rand(1, device=device)
+                    bg = gray_value.expand(3)
+                batch_backgrounds.append(bg)
+            backgrounds.append(torch.stack(batch_backgrounds, dim=0))  # [C, 3]
+        
+        return torch.stack(backgrounds, dim=0)  # [B, C, 3]
     
+
     def _render_with_gsplat(
         self,
         g_dict: Dict[str, torch.Tensor],
         mask: Optional[torch.Tensor],
-        view_mat: torch.Tensor,
-        K: torch.Tensor,
+        view_mats: torch.Tensor,
+        Ks: torch.Tensor,
         H: int,
         W: int,
         backgrounds: torch.Tensor
-    ) -> torch.Tensor:
-        """단일 Voxel에 대해 gsplat 렌더링 수행"""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 1. 속성 전처리 (배치 전체에 대해 한 번에 연산)
+        B, N, _ = g_dict['xyz'].shape
         device = g_dict['xyz'].device
-        
-        means = g_dict['xyz'].contiguous()
-        quats = g_dict['rotation'].contiguous()
-        scales = torch.exp(g_dict['scale']).contiguous()
-        opacities = torch.sigmoid(g_dict['opacity'].squeeze(-1)).contiguous()
-        
-        # SH 계수: [N, 3] + [N, 45] → [N, 16, 3]
-        sh_dc = g_dict['sh_dc']
-        sh_rest = g_dict['sh_rest']
-        
-        N = means.shape[0]
-        sh_higher = sh_rest.view(N, 15, 3)
-        sh_dc_expanded = sh_dc.unsqueeze(1)
-        sh = torch.cat([sh_dc_expanded, sh_higher], dim=1)
-        
-        # 값 범위 제한
-        scales = scales.clamp(min=1e-6, max=20.0)
-        opacities = opacities.clamp(0.0, 1.0)
-        quats = F.normalize(quats, dim=-1)
-        
-        # Masking
-        if mask is not None:
-            valid_idx = ~mask
-            if valid_idx.sum() == 0:
-                return torch.zeros((H, W, 3), device=device, requires_grad=True)
-            
-            means = means[valid_idx]
-            scales = scales[valid_idx]
-            quats = quats[valid_idx]
-            opacities = opacities[valid_idx]
-            sh = sh[valid_idx]
-        
-        if means.shape[0] == 0:
-            return torch.zeros((H, W, 3), device=device, requires_grad=True)
-        
-        try:
-            viewmats = view_mat.unsqueeze(0)
-            Ks = K.unsqueeze(0)
 
-            render_colors, render_alphas, meta = rasterization(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,
-                colors=sh,
-                viewmats=viewmats,
-                Ks=Ks,
-                width=W,
-                height=H,
-                sh_degree=3,
-                near_plane=0.01,
-                far_plane=100.0,
-                render_mode="RGB",
-                backgrounds=backgrounds
-            )
-            
-            render_colors = render_colors.squeeze(0).clamp(0.0, 1.0)
-            return render_colors, render_alphas
-        except Exception as e:
-            _print_main(f"[gsplat error] {e}")
-            return torch.zeros((H, W, 3), device=device, requires_grad=True), torch.zeros((H, W), device=device, requires_grad=True)
-    
-    def _get_random_camera(
+        means = g_dict['xyz']                                    # [B, N, 3]
+        quats = F.normalize(g_dict['rotation'], dim=-1)         # [B, N, 4]
+        scales = torch.exp(g_dict['scale']).clamp(max=20.0)      # [B, N, 3]
+        
+        # SH 계수 합치기 [B, N, 16, 3]
+        sh = torch.cat([g_dict['sh_dc'].unsqueeze(2), 
+                        g_dict['sh_rest'].view(B, N, 15, 3)], dim=2)
+
+        # 2. 마스킹 처리 (핵심: 텐서 모양을 유지하면서 투명도만 0으로)
+        opacities = torch.sigmoid(g_dict['opacity'].squeeze(-1)) # [B, N]
+        if mask is not None:
+            opacities = opacities * (~mask).float()  # opacity 0으로 마스킹
+        
+        # gsplat은 이제 [B, N, ...] 형태를 알아서 배치로 처리합니다.
+        render_colors, render_alphas, meta = rasterization(
+            means=means,           # [B, N, 3]
+            quats=quats,           # [B, N, 4]
+            scales=scales,         # [B, N, 3]
+            opacities=opacities,   # [B, N]
+            colors=sh,             # [B, N, 16, 3]
+            viewmats=view_mats, # [B, C, 4, 4]
+            Ks=Ks,              # [B, C, 3, 3]
+            width=W,
+            height=H,
+            sh_degree=3,
+            backgrounds=backgrounds, # [3], docs 랑 다르게 3채널만 받음
+            render_mode="RGB",
+            packed=False
+        )
+
+        # 결과값: [B, C, H, W, 3], [B, C, H, W, 1]
+        return render_colors.clamp(0.0, 1.0), render_alphas.squeeze(-1)
+
+    def _get_random_cameras(
         self, 
+        batch_size: int,
         device: torch.device, 
         H: int, 
-        W: int, 
-        fov_y: float, 
-        radius: float = 3.0
+        W: int,
+        n_cameras: int = 1,  # 카메라 개수 추가
+        fov_min: float = 45.0,
+        fov_max: float = 75.0,
+        radius: float = 5.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Voxel(-1~1)을 바라보는 랜덤 궤도 카메라"""
-        theta = torch.rand(1).item() * 2 * math.pi
-        phi = math.acos(1 - 2 * torch.rand(1).item())
+        """
+        배치별 랜덤 카메라 생성
         
-        cx = radius * math.sin(phi) * math.cos(theta)
-        cy = radius * math.sin(phi) * math.sin(theta)
-        cz = radius * math.cos(phi)
+        Args:
+            n_cameras: 배치당 생성할 카메라 개수
         
-        eye = torch.tensor([cx, cy, cz], device=device, dtype=torch.float32)
-        at = torch.tensor([0.0, 0.0, 0.0], device=device, dtype=torch.float32)
-        up = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=torch.float32)
+        Returns:
+            view_mats: [B, C, 4, 4]
+            Ks: [B, C, 3, 3]
+        """
+        B = batch_size
+        C = n_cameras
         
-        forward = F.normalize(at - eye, dim=0)
-        right = F.normalize(torch.linalg.cross(forward, up), dim=0)
-        up_new = torch.linalg.cross(right, forward)
-        
-        R = torch.stack([right, -up_new, forward], dim=0)
-        t = -torch.matmul(R, eye)
-        
-        view_mat = torch.eye(4, device=device)
-        view_mat[:3, :3] = R
-        view_mat[:3, 3] = t
-        
-        f_y = H / (2 * math.tan(fov_y / 2))
-        K = torch.eye(3, device=device)
-        K[0, 0] = f_y
-        K[1, 1] = f_y
-        K[0, 2] = W / 2.0
-        K[1, 2] = H / 2.0
-        
-        return view_mat, K
+        # 1. 배치별, 카메라별 랜덤 FOV 생성 [B, C]
+        fov_y_deg = torch.rand(B, C, device=device) * (fov_max - fov_min) + fov_min
+        fov_y = torch.deg2rad(fov_y_deg)  # [B, C]
+
+        # 2. 배치별, 카메라별 랜덤 구면 좌표계
+        theta = torch.rand(B, C, device=device) * 2 * math.pi  # [B, C]
+        phi = torch.acos(1 - 2 * torch.rand(B, C, device=device))  # [B, C]
+
+        # 3. 카메라 위치 (eye) 계산 [B, C, 3]
+        cx = radius * torch.sin(phi) * torch.cos(theta)
+        cy = radius * torch.sin(phi) * torch.sin(theta)
+        cz = radius * torch.cos(phi)
+        eye = torch.stack([cx, cy, cz], dim=-1)  # [B, C, 3]
+
+        at = torch.zeros((B, C, 3), device=device)
+        up = torch.tensor([0.0, 0.0, 1.0], device=device).expand(B, C, 3)
+
+        # 4. Look-at 로직 벡터화
+        forward = F.normalize(at - eye, dim=-1)  # [B, C, 3]
+        right = F.normalize(torch.linalg.cross(forward, up, dim=-1), dim=-1)  # [B, C, 3]
+        up_new = torch.linalg.cross(right, forward, dim=-1)  # [B, C, 3]
+
+        # 5. View Matrix 구성 [B, C, 4, 4]
+        R = torch.stack([right, -up_new, forward], dim=2)  # [B, C, 3, 3]
+        t = -torch.bmm(R.view(B*C, 3, 3), eye.view(B*C, 3, 1))  # [B*C, 3, 1]
+        t = t.view(B, C, 3, 1)  # [B, C, 3, 1]
+
+        view_mats = torch.eye(4, device=device).unsqueeze(0).unsqueeze(0).repeat(B, C, 1, 1)  # [B, C, 4, 4]
+        view_mats[:, :, :3, :3] = R
+        view_mats[:, :, :3, 3:4] = t
+
+        # 6. 배치별, 카메라별 내적 행렬 K 구성 [B, C, 3, 3]
+        f_y = H / (2 * torch.tan(fov_y / 2))  # [B, C]
+        Ks = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).repeat(B, C, 1, 1)  # [B, C, 3, 3]
+        Ks[:, :, 0, 0] = f_y
+        Ks[:, :, 1, 1] = f_y
+        Ks[:, :, 0, 2] = W / 2.0
+        Ks[:, :, 1, 2] = H / 2.0
+
+        return view_mats, Ks
     
     # ==========================================================================
     # [3] Sparsity Loss
@@ -658,20 +735,22 @@ class GMAELoss(nn.Module):
             out_g: 출력 가우시안 파라미터
             out_mask: 패딩 마스크 (True=Invalid)
         """
-        
-        opacity = torch.sigmoid(out_g['opacity']).squeeze(-1)  # [B, M]
-        log_scale = out_g['scale']  # [B, M, 3], 이미 log scale (학습 파라미터)
-        
+        logit_opacity = out_g['opacity']
+        log_scale = out_g['scale']
+
         # Valid mask 적용 (padding 제거)
         if out_mask is not None:
             valid_mask = ~out_mask
             if valid_mask.sum() == 0:
-                return torch.tensor(0.0, device=opacity.device, requires_grad=True)
-            valid_opacity = opacity[valid_mask]
+                return torch.tensor(0.0, device=logit_opacity.device, requires_grad=True)
+            valid_opacity = logit_opacity[valid_mask]
             valid_log_scale = log_scale[valid_mask]
         else:
-            valid_opacity = opacity
+            valid_opacity = logit_opacity
             valid_log_scale = log_scale
+
+        valid_opacity = torch.sigmoid(valid_opacity).squeeze(-1)  # [B, M]
+
         
         # log_scale 범위: [ln(1e-8), ln(20)] = [-18.4, 2.996]
         log_scale = valid_log_scale.mean(dim=-1)  # [num_valid], 각 가우시안의 평균 scale
@@ -685,11 +764,12 @@ class GMAELoss(nn.Module):
 
         MAX_SCALE = 0.03
         normalized_scale_clamped = torch.clamp(normalized_scale, max=MAX_SCALE)
-        
-        valid_penalty = -1.0 * (torch.log(valid_opacity_clamped + 1e-20) - torch.log(torch.tensor(MAX_OPACITY + 1e-20))) * 5
-        scale_penalty = -1.0 * (torch.log(normalized_scale_clamped + 1e-20) - torch.log(torch.tensor(MAX_SCALE + 1e-20)))
+        eps = 1e-6
+
+        valid_penalty = -1.0 * (torch.log(valid_opacity_clamped + eps) - torch.log(torch.tensor(MAX_OPACITY + eps))) * 5
+        scale_penalty = -1.0 * (torch.log(normalized_scale_clamped + eps) - torch.log(torch.tensor(MAX_SCALE + eps)))
         std_penalty =  (1 - valid_opacity * normalized_scale).std() * 5
-        linear_push_loss = (1.0 - valid_opacity) * 0.1 + (1.0 - normalized_scale) * 0.05
+        linear_push_loss = (1.0 - valid_opacity) * 1 + (1.0 - normalized_scale) * 0.5
         presence_penalty = (valid_penalty + scale_penalty + linear_push_loss).mean()
         
         utilization_loss = presence_penalty + std_penalty

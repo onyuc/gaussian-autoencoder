@@ -48,9 +48,9 @@ loss:
 
 # Output
 output:
-  save_dir: "/scratch/rchkl2380/Workspace/gaussian-autoencoder/checkpoints/ssim_512_std"
+  save_dir: "./checkpoints/ssim_512_std"
   save_interval: 100
-  debug_save_dir: "/scratch/rchkl2380/Workspace/gaussian-autoencoder/checkpoints/ssim_512_std/debug_renders"
+  debug_save_dir: "./checkpoints/ssim_512_std/debug_renders"
   debug_save_epochs: 1
 # TensorBoard
 tensorboard:
