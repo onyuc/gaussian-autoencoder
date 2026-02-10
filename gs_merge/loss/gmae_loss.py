@@ -307,16 +307,28 @@ class GMAELoss(nn.Module):
         # Near-Input Sampling (70%)
         rand_indices = torch.randint(0, N, (B, n_near), device=device)
         selected_xyz = self._batch_gather(in_g['xyz'], rand_indices)
-        selected_scale = self._batch_gather(in_g['scale'], rand_indices)
+        selected_log_scale = self._batch_gather(in_g['scale'], rand_indices)
+        selected_quat = self._batch_gather(in_g['rotation'], rand_indices)    # [B, n_near, 4]
         
-        noise = torch.randn_like(selected_xyz)
-        queries_near = selected_xyz + noise * selected_scale
+        selected_scale = torch.exp(selected_log_scale).clamp(min=1e-6, max=20.0)
+
+        # Quaternion → Rotation Matrix
+        selected_quat = F.normalize(selected_quat, dim=-1)  # [B, n_near, 4]
+        R = self._quat_to_rotmat(selected_quat)  # [B, n_near, 3, 3]
+        
+        noise_local = torch.randn_like(selected_xyz) / 3  # [B, n_near, 3] - Local 좌표계
+        noise_local = noise_local * selected_scale    # Scale 적용
+        
+        # Local → World 변환 (R * noise_local)
+        noise_world = torch.einsum('bnij,bnj->bni', R, noise_local)  # [B, n_near, 3]
+        
+        queries_near = selected_xyz + noise_world  # [B, n_near, 3]
         
         # Uniform Sampling (30%)
-        queries_uniform = (torch.rand(B, n_uniform, 3, device=device) * 2.0) - 1.0
+        queries_uniform = (torch.rand(B, n_uniform, 3, device=device) * 3.0) - 1.5
         
         query_points = torch.cat([queries_near, queries_uniform], dim=1)
-        query_points = torch.clamp(query_points, -1.0, 1.0)
+        # query_points = torch.clamp(query_points, -1.0, 1.0)
         
         # Density 계산
         d_in = self._get_density_field(query_points, in_g, in_mask)
